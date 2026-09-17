@@ -1,10 +1,11 @@
 <div align="center">
 
+<!-- Banner: 把一张 banner 图放进 assets/banner.png 后,去掉下一行的注释即可显示 -->
 <!-- <img src="assets/banner.png" alt="bulus-skill-auditor" width="100%"> -->
 
-# 🩺 bulus-skill-auditor
+# 🩺 skill 体检大师
 
-**skill 体检大师 —— 给你的 skill 库做一次体检：谁在白烧钱、谁重复了、谁教的东西模型已经会了**
+**给你的 skill 库做一次全身体检，揪出白烧钱和该退役的家伙**
 
 **想了解更多最新AI行业动态,AI+电商/广告的行业实践方法,人与AI如何协作共生的思考,请关注公众号:【新西楼.AI】**
 
@@ -14,89 +15,107 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Version](https://img.shields.io/badge/version-0.1.0-black.svg)]()
 
-**真账单 · 四类诊断 · 原生覆盖检测 · 重构优先于删除 · 跨 Agent**
+**真账单 · 四类诊断 · 对比考试 · 改造优先于删除 · 跨 Agent**
 
 **Created By Buluu@新西楼.AI**
 
 </div>
 
+---
+
 ## 项目简介
 
-你说一句"帮我审计一下 skills"，Skill 会扫描本机全部 agent 的 skill 库（Claude Code / Codex / Hermes），计算每个 skill 的常驻 token 成本、30 天真实使用记录和重复度，基于账单、闲置、结构、内容价值四类信号做诊断，再对拿不准的高嫌疑做"带 skill vs 裸模型"对比考试（需你确认预算）——验证它教的东西现在的模型是不是本来就会，最后输出一套带真账单、四类诊断结论、瘦身方案的完整体检报告（顺手附一份"我到底装了哪些 skill"的清单）。
+skill 体检大师（bulus-skill-auditor）是由 buluslan（公众号：新西楼.AI）研发的 skill 库体检工具，他会扫一遍你装在 Claude Code、Codex、Hermes 里的全部 skills，算出每个 skill 的真实花销、查出谁和谁重复、揪出装了没用的家伙，还会出一场"带着 skill 和裸奔对比"的考试，验证哪些 skill 教的东西现在的模型本来就会——最后输出一份带真账单、诊断结论和瘦身方案的完整体检报告。
 
-**Agent 通用**：skill 是 agent 无关的指令集，本工具天然跨 agent——审计对象支持 Claude Code / Codex / Hermes（每种 agent 一个适配器，可扩展更多），本体可装进 Claude Code skills 路径（Codex / Cursor / OpenCode 用户：把 SKILL.md 当指令喂给 agent 即用）。
+> [!TIP]
+> **更多 AI 实战内容，请关注公众号「新西楼.AI」**
+
+作为 **Agent 原生** 工具，它适配各类 AI Coding Agent，只依赖一个 Python 库，clone 下来就能跑。**只建议不动手** —— 告诉你"哪里有问题、该改什么、能省多少"，删和改由你自己决定。每个数字都附一条你可以亲手跑的复核命令——这个赛道吹牛的工具太多，经得起对账是它的立身之本。
 
 **为什么你需要它：**
 
-- ❌ skill 越装越多，每个的简介每次对话都在占 token——白付了多少钱没人给你算过账
-- ❌ skill 装到一定数量，列表会被**静默截断**：一部分 skill 直接从模型视野消失，你根本不知道
-- ❌ 模型一直在升级，老 skill 教的东西现在可能模型原生就会——但没有任何工具判断"哪些该退役了"
+- ❌ skill 越装越多，每个的简介每次对话都在占地方——白付了多少钱，没人给你算过账
+- ❌ skill 装到一定数量，列表会被**悄悄截断**：一部分 skill 直接从模型视野里消失，你根本不知道
+- ❌ 模型一直在升级，老 skill 教的东西现在可能模型本来就会——但没有任何工具告诉你"哪些该退役了"
 - ❌ 现有清理工具只会看"多久没用过"，终点都是删——没人告诉你"别删，这样改瘦就值了"
 
 ## ✨ 它做什么
 
-| 能力 | 说明 |
-|---|---|
-| **真账单** | 三笔账分开算：常驻成本（不用也在占）、加载成本（触发读 SKILL.md 才花）、参考文件成本（按需读参考文件才花）；o200k 计量（与官方 tokenizer 偏差 ≤10%）；中文 skill 计量准确——实测同类工具的估算法在中文场景**低估 70-75%** |
-| **四类诊断** | 重复（含"换皮 skill"识别）/ 疑似过时（模型已原生覆盖）/ 超重 / 健康 |
-| **原生覆盖检测** | 对比考试：同一道题让模型带着 skill 做一遍、裸做一遍，答卷差不多 = 它教的东西模型本来就会（附带 skill / 不带 skill 的两份原始分，可复核） |
-| **重构建议** | 改造优先于删除：砍掉模型常识部分留独门核心、确定性逻辑下沉到脚本、超重正文拆成按需加载的参考文件——每条建议都附依据数据和预计收益 |
-| **一份清单** | 顺手产出全量 skill 分类清单，记不起装了什么时丢给 agent 自己判断 |
-| **多 Agent** | Claude Code（全功能）/ Codex（全功能）/ Hermes（设计支持），每种 agent 一个适配器、可扩展 |
-| **省钱阀门** | 深度评测前先便宜预筛（一次调用三出口），只对真正拿不准的烧钱；跑前报价你点头才跑 |
-| **只建议不动手** | 对被审计对象 100% 只读，处置 100% 留人工确认 |
+一句话触发，出一份多维度体检报告:
+
+| 体检项 | 底座 | 回答的问题 |
+|---|---|---|
+| **真账单** | 本地精算（与官方口径偏差 ≤10%，中文也准） | 我每个 skill 每次对话白付多少钱? |
+| **四类诊断** | 重复度比对 + 结构检查 + 使用记录 | 谁重复了、谁太肥、谁装了没用、谁健康? |
+| **原生覆盖检测** | 对比考试：同一道题，带 skill 做一遍、裸奔做一遍 | 这个 skill 教的东西，现在的模型是不是本来就会? |
+| **瘦身建议** | 六条改瘦手法（改瘦优先于删除） | 别删——砍掉模型都会的部分，留独门货，怎么改? |
+| **skill 清单** | 顺手产出的分类清单 | 我到底装了哪些? 记不起来时丢给 agent 自己判断 |
+
+**对比考试怎么读**：两份答卷差不多，说明模型已经原生会了，这个 skill 疑似过时（附两份原始分，你可以复核）；带着 skill 明显做得更好，说明它有真本事，留着。
 
 ## 🚀 快速开始
 
-装进 skills 路径后，直接对话触发：
+装进 skills 路径后，直接对话触发:
 
 ```text
-帮我审计一下我的 skills          # 免费层：真账单 + 四类诊断 + 处置建议（分钟级）
-生成一份我的 skill 清单           # 只要清单（脚本层秒级）
-深度审计，预算 3 美元以内          # 含对比考试（先报价，你点头才花钱）
-新模型发布了，重新扫一遍高嫌疑     # 复用考题库换新模型重考，两份答卷分差的变化 = 价值衰减信号
+帮我审计一下我的 skills       # 全量体检（免费，几分钟出报告）
+生成一份我的 skill 清单        # 只要清单（最快）
+深度审计，预算 3 美元以内       # 含对比考试（先报价，你点头才花钱）
+新模型发布了，重新扫一遍       # 换新模型重考，分数变化 = 价值变化信号
 ```
 
-单脚本也可直接跑（免对话）：
+单脚本也可直接跑（免对话）:
 
 ```bash
-python3 scripts/collect.py --out-dir ./skill-audit-output/    # 扫描全 agent skill 库（脚本层秒级）
-python3 scripts/measure.py ./skill-audit-output/00-inventory.json --out ./skill-audit-output/01-metrics.json
-python3 scripts/render_report.py --metrics ./skill-audit-output/01-metrics.json --out ./skill-audit-output/03-report.md
+pip install tiktoken
+python scripts/collect.py --out-dir ./skill-audit-output/          # 扫描全部 agent 的 skill 库
+python scripts/measure.py ./skill-audit-output/00-inventory.json --out ./skill-audit-output/01-metrics.json
+python scripts/render_report.py --metrics ./skill-audit-output/01-metrics.json --out ./skill-audit-output/03-report.md
 ```
-
-依赖：Python 3.9+，`pip install tiktoken`（仅此一个）。
 
 ## 🧠 它怎么判断
 
-- **免费层（静态）**：扫文件算账——常驻/加载/参考文件三笔 token、使用记录（窗口数来自会话扫描，终身计数来自官方静态数据源）、Jaccard 重复度（跨 agent 换名重复也抓）、结构检查（超重无 refs / 简介超长 / listing 超预算静默截断警示）
-- **深度层（付费，可选）**：先预筛（明显有独门价值的直接放行、明显是模型常识的标疑似），只对拿不准的出题考试；**出题铁律：考 skill 的私有资产（独有框架/标签/流程），不考模型原生就会的通用能力**——否则裸模型也能满分，好 skill 会被误判
-- **判定矩阵**：两份答卷同分且考了私有资产 = 疑似原生覆盖（须人工复核）；带 skill 明显更好 = 有真实价值；考题无区分度 = 回炉重出，不下结论
-- **数字诚实**：所有结论挂数据源 + 可自行执行的复核命令；"疑似"永远不写成"确定"
+- **免费层（扫文件算账）**：每个 skill 三笔账分开算——常驻（简介每次对话都占，不用也在花钱）、加载（真被叫起来干活时读全文）、参考文件（按需去读才花）；再查重复（同一个 skill 在两个 agent 各装一份、甚至换了名字重新包装的，都认得出来）、查结构（正文超重该拆、简介超长每次多花钱、skill 列表总量超官方额度会被悄悄截断——被截掉等于白装）
+- **深度层（花你的钱，先报价）**：先花小钱粗筛一遍每个可疑 skill 的内容——明显有独门本事的直接放行、明显是模型常识的标"疑似过时"；只对真正拿不准的出题考试，用两份答卷的分差说话。**出题铁律：考 skill 的独门货（它独有的框架、标签、流程），不考模型本来就会的通用能力**——否则裸模型也能拿满分，好 skill 会被冤枉
+- **防冤枉三保险**：结论分级（确定/疑似/需人工确认）、每条结论附数据和复核命令、"疑似"永远不写成"确定"
 
-与官方 /doctor、/skill-doctor 的关系：官方管"用不用、贵不贵"（运行时用量），本工具管"写得好不好、内容还值不值"（质量 + 内容价值 + 重构建议）——互补不竞争，与官方重叠的口径（unused 三档、listing 预算）直接对齐官方源码结论。
+与官方 /doctor 的关系：官方管"你用没用、贵不贵"，本工具管"写得好不好、内容还值不值"——互补不竞争，重叠的数字直接对齐官方口径。
 
 ## 📁 结构
 
 ```
 bulus-skill-auditor/
-├── SKILL.md              # 主入口（薄路由：模式识别 / 预算决策 / 报告缝合）
+├── SKILL.md              # 主入口（识别你要什么、控制花钱节奏、缝合报告）
 ├── scripts/
-│   ├── collect.py        # 多 agent 扫描 + 使用统计（双源）
-│   ├── measure.py        # token 计量 / 重复检测 / 结构检查 / 优先级
-│   ├── render_report.py  # 报告骨架渲染（聚合数字全部脚本算）+ 注入位
-│   ├── evaluate.py       # 对比考试编排（plugin 组装 → 官方 eval → Δ 汇总 → 缓存）
-│   ├── usage.py          # 会话记录使用统计（可独立跑）
-│   └── adapters/         # agent 适配器：claude_code / codex / hermes
-├── references/           # 判读规范：审计判据 / 出题铁律 / 重构手册 / 报告格式
+│   ├── collect.py        # 扫描全部 agent 的 skill 库 + 使用统计
+│   ├── measure.py        # 三笔账 + 重复检测 + 结构检查 + 优先级排序
+│   ├── render_report.py  # 报告骨架渲染（所有汇总数字脚本算，不手算）
+│   ├── evaluate.py       # 对比考试编排（出题 → 考试 → 判分 → 存档）
+│   ├── usage.py          # 聊天记录里的使用统计（可单独跑）
+│   └── adapters/         # 各 agent 的适配器: claude_code / codex / hermes
+├── references/           # 判读规范: 审计判据 / 出题铁律 / 瘦身手法 / 报告格式
 └── evals/                # 测试剧本
 ```
 
+## 🏠 交流社区
+
+<div align="center">
+
+🎯 **更多 AI 实战教程和专属福利尽在我们「MBG 跨境AI实战圈」,已有 50+ 跨境大卖、AI 专家热聊中**
+
+—— 欢迎跨境电商从业者加入我们,一起探索 AI+商业的最佳实践和真实边界,跑通【跨境AI】的从 0 到 1,打败你的同事,干掉你的老板。
+
+**社区介绍:[mp.weixin.qq.com/s/dOz4fLmRnaFR7sD_TQm00Q](https://mp.weixin.qq.com/s/dOz4fLmRnaFR7sD_TQm00Q)**
+
+<img width="1125" height="618" alt="image" src="https://github.com/user-attachments/assets/20f47cd6-e33c-4f3e-9362-3846c11135fd" />
+
+</div>
+
 ## 📜 License
 
-MIT License · Created By Buluu@新西楼.AI
+MIT — 随便用,欢迎 PR 扩展 agent 适配器。
 
-## 📖 写在最后
+---
 
 <div align="center">
 
