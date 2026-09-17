@@ -12,7 +12,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-0.1.1-black.svg)]()
+[![Version](https://img.shields.io/badge/version-0.1.2-black.svg)]()
 
 **Token 账单 · 四类诊断 · 对比考试 · 改造优先于删除 · 跨 Agent**
 
@@ -23,6 +23,8 @@
 ---
 
 ## 项目简介
+
+skill 体检大师（bulus-skill-auditor）是由 **buluslan（公众号：新西楼.AI）** 研发的 skill 库体检与治理工具。
 
 你输入本机的 skill 库，skill 体检大师会扫描 Claude Code 与 Codex 的安装目录（Hermes 适配器目前为实验性），分别估算常驻、触发和参考文件的 token 成本，再结合重复度、结构和近期使用记录做诊断；经你确认预算后，它还能运行“带 skill / 不带 skill”的对比评测，最后输出带统计口径、复核命令和瘦身建议的体检报告。
 
