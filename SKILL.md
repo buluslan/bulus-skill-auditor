@@ -2,16 +2,15 @@
 name: bulus-skill-auditor
 author: Buluu@新西楼.AI
 description: |
-  skill体检大师（bulus-skill-auditor）是由buluslan（公众号：新西楼.AI）研发的 skill 库体检工具，他会帮你把一堆越装越多的 skills 变成一份能落地的治理方案——真实 token 账单（不用也在占的常驻成本、触发了才花的加载成本分开算）、四类诊断（重复/疑似过时/超重/健康）、"带 skill 与裸模型"对比考试验证哪些 skill 教的东西模型已经原生就会、以及改造优先于删除的瘦身建议。每份报告的每个数字都附复核命令，经得起对账。
-  更多 Agent / skill 治理实操内容，请关注公众号「新西楼.AI」。
-  Cross-agent skill audit & governance: real token bill, 4-category diagnosis, native-coverage detection via paired eval, refactor-first recommendations. Read-only, evidence-backed, budget-gated.
+  由 buluslan（公众号：新西楼.AI）研发的 skill 库体检工具。扫描已安装的 skills，估算常驻/触发 token，识别重复、超重与近期少用项，并在用户批准预算后运行带/不带 skill 的对比评测，输出可复核的治理建议。
+  Cross-agent skill audit and governance: local token estimates, four-category diagnosis, paired evaluation, and refactor-first recommendations. Read-only, evidence-backed, budget-gated.
   当用户需要以下功能时触发：审计/检查/清理 skills、skill 太多了想瘦身、想知道哪些 skill 没用/在白烧钱/重复了、模型升级后重扫 skill 价值、生成 skill 清单（记不起装了什么时）、深度验证某个 skill 是否已被模型原生覆盖。
   触发关键词：skill 体检、skill 审计、skill 清理、skill 瘦身、skill 治理、skill 太多、skill 清单、audit my skills、skill cleanup。
   NOT for 创建新 skill 或改进某个 skill 的内容（那是 skill-creator 的活）、MCP/plugins 治理（官方 /doctor 已覆盖）。
 license: MIT
 metadata:
   category: agent-tools
-  version: 0.1.0
+  version: 0.1.1
 ---
 
 # 🩺 skill 体检大师（bulus-skill-auditor）
@@ -20,11 +19,11 @@ metadata:
 
 > 💡 本工具是 **buluslan** 的开源项目（MIT）。更多 Agent / skill 治理实操内容，关注公众号「**新西楼.AI**」。
 
-skill 库的体检与治理工具，Agent 原生设计，任何主流 AI Coding Agent 均可运行。审计对象覆盖 Claude Code、Codex、Hermes 三种 agent；新的 agent 只要写一个适配器（见 scripts/adapters/）就能接入。
+skill 库的体检与治理工具，Agent 原生设计。当前已适配 Claude Code 与 Codex，Hermes 适配器为实验性；新的 agent 可通过新增适配器（见 scripts/adapters/）接入。
 
 ## 核心能力
 
-- **真账单**: 每个 skill 三笔账分开算——常驻成本（简介每次对话都占 context，哪怕从没被用过）、加载成本（真被触发时读 SKILL.md 全文的花费）、参考文件成本（触发后 Agent 按需去读 references/ 文件时才产生，不读不花钱）。token 全部本地计量（用 tiktoken 的 o200k 编码，不联网、不产生 API 费用），与官方 tokenizer 的偏差不超过 10%；中文 skill 也量得准——实测同类工具的估算法在中文场景会低估 70-75%。
+- **Token 账单**: 每个 skill 三笔账分开算——常驻成本（简介可能进入上下文）、加载成本（触发时读取 SKILL.md）、参考文件成本（按需读取 references/）。token 使用 tiktoken 的 o200k 编码在本地估算；这是统一口径的工程估值，不等同于各 Agent、模型或供应商的最终计费结果。
 - **四类诊断**: 重复（包括"换皮"的情况：同一个 skill 在 Claude Code 和 Codex 各装了一份、内容几乎相同，也算重复）/ 疑似过时（它教的东西现在的模型是不是本来就会）/ 超重（该拆该瘦）/ 健康
 - **原生覆盖检测**: 深度层的对比考试——同一道题让模型带着 skill 做一遍、不带裸做一遍，两份答卷差不多就是"模型已原生会了"的实证（附带/不带 skill 的两份原始分，用户可复核）
 - **重构建议**: 改造优先于删除——"别删，砍掉模型常识部分、留独门核心，预计省 X token"；每条建议都附上三样东西：它依据的数据、预计能省多少 token、一个留给用户确认"是否执行"的位置
@@ -92,9 +91,9 @@ python3 <skill_dir>/scripts/render_report.py --metrics <out>/01-metrics.json --i
 2. **预筛（省钱的关键）**：对每个候选通读 SKILL.md 全文，判断"它教的东西是不是当前模型的常识"。三类出口：明显有独门货（私有数据、特定阈值、领域深知识）的直接标"预筛有价值"，这类不用花考试钱就能下结论；明显是常识的标"疑似原生覆盖"，默认不验（不替用户花这个钱），用户点名要验再单独跑；拿不准的才进考试，用两份答卷的分差说话。判断依据与出口定义在 audit-rubric.md。
 3. **出题与考试**：出题规范在 [references/case-authoring.md](references/case-authoring.md)——核心铁律：**考 skill 的私有资产，不考模型原生就会的通用能力**（例如考它独有的 22 维标签体系，不考"会不会结构化分析"）。违反这条，裸模型也能满分，好 skill 会被误判成过时。然后执行（`--skills` 填这些 skill 的 id，从 01-metrics.json 的高嫌疑名单里取）：
    ```bash
-   python3 <skill_dir>/scripts/evaluate.py --skills <id1,id2> --out-dir <out> --max-cost-usd <预算>
+   python3 <skill_dir>/scripts/evaluate.py --skills <id1,id2> --out-dir <out> --max-cost-usd <单项上限> --total-budget-usd <总预算>
    ```
-   注意 `--max-cost-usd` 是**单个 skill** 的花费硬顶，总花费上限 = 该值 × 待验 skill 数——报价时按总额换算着传（例如总预算 $3、验 5 个，传 `--max-cost-usd 0.6`）。
+   `--max-cost-usd` 限制单个 skill，`--total-budget-usd` 限制本次运行总额；剩余总预算不足时不再启动下一个评测。
    当前是 Claude Code 环境时，它直接调用 Claude Code 官方的评测机制来跑这场对比考试；其他 agent 环境先探索该生态有无等价工具（结果缓存，不必每次重找），没有就跳过并在报告如实标注"内容价值未验证"。
 4. **读结果**：02-eval-results.json 里每个 skill 的判定（疑似原生覆盖/有价值/无结论——case 无区分度需回炉重出）与证据都已就位。你复核后，用 `--eval <out>/02-eval-results.json` 参数重跑第三步的渲染命令，报告第六节骨架即会出现，再把你的复核判断写进它的注入位——"疑似"字样必须保留，最终判断交用户。
 

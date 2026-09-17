@@ -12,9 +12,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-0.1.0-black.svg)]()
+[![Version](https://img.shields.io/badge/version-0.1.1-black.svg)]()
 
-**真账单 · 四类诊断 · 对比考试 · 改造优先于删除 · 跨 Agent**
+**Token 账单 · 四类诊断 · 对比考试 · 改造优先于删除 · 跨 Agent**
 
 **Created By Buluu@新西楼.AI**
 
@@ -24,12 +24,16 @@
 
 ## 项目简介
 
-skill 体检大师（bulus-skill-auditor）是由 buluslan（公众号：新西楼.AI）研发的 skill 库体检工具，他会扫一遍你装在 Claude Code、Codex、Hermes 里的全部 skills，算出每个 skill 的真实花销、查出谁和谁重复、揪出装了没用的家伙，还会出一场"带着 skill 和裸奔对比"的考试，验证哪些 skill 教的东西现在的模型本来就会——最后输出一份带真账单、诊断结论和瘦身方案的完整体检报告。
+你输入本机的 skill 库，skill 体检大师会扫描 Claude Code 与 Codex 的安装目录（Hermes 适配器目前为实验性），分别估算常驻、触发和参考文件的 token 成本，再结合重复度、结构和近期使用记录做诊断；经你确认预算后，它还能运行“带 skill / 不带 skill”的对比评测，最后输出带统计口径、复核命令和瘦身建议的体检报告。
+
+| 它读取 | 它检查 | 你得到 |
+|---|---|---|
+| SKILL.md、references、可用的本地使用记录 | token 体量、重复内容、结构负担、近期使用、对比评测 | 分类清单、证据、复核命令、改造建议 |
 
 > [!TIP]
 > **更多 AI 实战内容，请关注公众号「新西楼.AI」**
 
-作为 **Agent 原生** 工具，它适配各类 AI Coding Agent，只依赖一个 Python 库，clone 下来就能跑。**只建议不动手** —— 告诉你"哪里有问题、该改什么、能省多少"，删和改由你自己决定。每个数字都附一条你可以亲手跑的复核命令——这个赛道吹牛的工具太多，经得起对账是它的立身之本。
+作为 **Agent 原生** 工具，它已适配 Claude Code 与 Codex，并提供实验性的 Hermes 适配器；其他 Agent 可通过新增适配器接入。**只建议不动手** —— 告诉你哪里有问题、该改什么、预计能省多少，删和改由你自己决定。每个关键数字都附复核口径或命令。
 
 **为什么你需要它：**
 
@@ -44,7 +48,7 @@ skill 体检大师（bulus-skill-auditor）是由 buluslan（公众号：新西�
 
 | 体检项 | 底座 | 回答的问题 |
 |---|---|---|
-| **真账单** | 本地精算（与官方口径偏差 ≤10%，中文也准） | 我每个 skill 每次对话白付多少钱? |
+| **Token 账单** | 用本地 tokenizer 做工程估算，并明确编码、文件范围与假设 | 每个 skill 的常驻、触发和参考文件成本各是多少? |
 | **四类诊断** | 重复度比对 + 结构检查 + 使用记录 | 谁重复了、谁太肥、谁装了没用、谁健康? |
 | **原生覆盖检测** | 对比考试：同一道题，带 skill 做一遍、裸奔做一遍 | 这个 skill 教的东西，现在的模型是不是本来就会? |
 | **瘦身建议** | 六条改瘦手法（改瘦优先于删除） | 别删——砍掉模型都会的部分，留独门货，怎么改? |
@@ -66,10 +70,17 @@ skill 体检大师（bulus-skill-auditor）是由 buluslan（公众号：新西�
 单脚本也可直接跑（免对话）:
 
 ```bash
+cd /path/to/bulus-skill-auditor
 pip install tiktoken
 python scripts/collect.py --out-dir ./skill-audit-output/          # 扫描全部 agent 的 skill 库
 python scripts/measure.py ./skill-audit-output/00-inventory.json --out ./skill-audit-output/01-metrics.json
 python scripts/render_report.py --metrics ./skill-audit-output/01-metrics.json --out ./skill-audit-output/03-report.md
+```
+
+报告可能包含本机绝对路径和本地使用统计。对外分享前先生成脱敏副本：
+
+```bash
+python scripts/redact_report.py ./skill-audit-output/00-inventory.json --out ./skill-audit-output/00-inventory.share.json
 ```
 
 ## 🧠 它怎么判断

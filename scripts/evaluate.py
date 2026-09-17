@@ -182,6 +182,8 @@ def main(argv=None):
                     help='00-inventory.json（取 skill 实际目录），默认 <out-dir>/00-inventory.json（B2：随 --out-dir 联动）')
     ap.add_argument('--out-dir', default='skill-audit-output', help='输出目录（case 库 <out-dir>/cases/ 也在其中），默认：%(default)s')
     ap.add_argument('--max-cost-usd', type=float, default=DEFAULT_BUDGET, help='传 CLI 的单 skill 成本硬顶 USD，默认：%(default)s')
+    ap.add_argument('--total-budget-usd', type=float, default=None,
+                    help='本次运行总预算硬顶 USD；省略时等于单 skill 上限 × skill 数')
     ap.add_argument('--runs', type=int, default=DEFAULT_RUNS, help='每 case 每臂运行次数，默认：%(default)s')
     ap.add_argument('--skip-cached', action='store_true', help='02 已有该 skill 有效结果且模型未变（配 --model）则跳过')
     ap.add_argument('--model', default='unknown', help='当前运行时模型名（缓存比对；默认 unknown=视为未变）')
@@ -189,6 +191,12 @@ def main(argv=None):
     ap.add_argument('--keep-temp', action='store_true', help='保留 .eval-tmp 临时 pkg（调试）')
     ap.add_argument('--json', action='store_true', help='stdout 追加机器可读运行摘要')
     args = ap.parse_args(argv)
+    if args.runs <= 0:
+        ap.error('--runs 必须大于 0')
+    if args.max_cost_usd <= 0:
+        ap.error('--max-cost-usd 必须大于 0')
+    if args.total_budget_usd is not None and args.total_budget_usd <= 0:
+        ap.error('--total-budget-usd 必须大于 0')
     if args.inventory is None:  # B2：--inventory 默认值随 --out-dir 联动（默认 out-dir 时与旧行为一致）
         args.inventory = os.path.join(args.out_dir, '00-inventory.json')
 
@@ -218,6 +226,8 @@ def main(argv=None):
     results, errors, warnings, n_cached, spent = [], [], [], 0, 0.0
     # B2：--skills 分隔宽容（逗号/空白均可；不做位置参数，保持契约清晰）
     ids = [x for x in re.split(r'[,\s]+', args.skills) if x]
+    total_budget = (args.total_budget_usd if args.total_budget_usd is not None
+                    else args.max_cost_usd * max(1, len(ids)))
     for sid in ids:
         if sid in cached and cache_valid(cached[sid], args.model):
             c = dict(cached[sid])
@@ -230,6 +240,10 @@ def main(argv=None):
                  'verdict': 'inconclusive', 'evidence': '', 'cost_usd': None, 'model': 'unknown',
                  'evaluated_at': now_iso(), 'runs': args.runs, 'duration_seconds': None, 'error': None}
         results.append(entry)
+        remaining = round(total_budget - spent, 6)
+        if remaining <= 0:
+            fail(entry, errors, 'budget', '本次总预算已用完，未启动该 skill 的评测')
+            continue
         skill = index.get(sid)
         if skill is None:
             fail(entry, errors, 'resolve', 'inventory 里找不到该 skill id（--inventory 对了吗）')
@@ -248,9 +262,12 @@ def main(argv=None):
             fail(entry, errors, 'assemble', 'pkg 组装失败：%s' % e)
             continue
         raw_path = os.path.join(raw_dir, sanitize(sid) + '.json')
-        print('[$ %s]（cwd=%s）' % (' '.join(cli_command(args.runs, args.max_cost_usd, raw_path)), pkg_dir), flush=True)
+        skill_budget = min(args.max_cost_usd, remaining)
+        print('[$ %s]（cwd=%s；本次剩余总预算 $%.2f）' % (
+            ' '.join(cli_command(args.runs, skill_budget, raw_path)), pkg_dir, remaining), flush=True)
         if args.dry_run:
             raw = fake_result(sid, [n for n, _ in cases], args.runs)
+            raw['costUsd'] = min(raw['costUsd'], skill_budget)
             try:
                 with open(raw_path, 'w', encoding='utf-8') as f:
                     json.dump(raw, f, ensure_ascii=False, indent=2)
@@ -258,7 +275,7 @@ def main(argv=None):
                 fail(entry, errors, 'parse', 'dry-run 假结果写入失败：%s' % e)
                 continue
         else:
-            ok, detail = run_cli(pkg_dir, args.runs, args.max_cost_usd, raw_path)
+            ok, detail = run_cli(pkg_dir, args.runs, skill_budget, raw_path)
             if not ok:
                 fail(entry, errors, 'cli', detail)
                 continue
@@ -283,7 +300,9 @@ def main(argv=None):
     out_path = os.path.join(out_dir, '02-eval-results.dry-run.json' if args.dry_run
                             else '02-eval-results.json')
     clean = [{k: v for k, v in r.items() if k != 'cached'} for r in results]  # cached 标志只描述本次
-    doc = {'evaluated_at': now_iso(), 'model': top_model, 'budget_usd': args.max_cost_usd,
+    doc = {'evaluated_at': now_iso(), 'model': top_model,
+           'budget_usd': args.max_cost_usd, 'total_budget_usd': total_budget,
+           'total_cost_usd': round(spent, 2),
            'cost_note': COST_NOTE, 'runs': args.runs, 'dry_run': args.dry_run,
            'results': clean, 'errors': errors, 'warnings': warnings}
     try:

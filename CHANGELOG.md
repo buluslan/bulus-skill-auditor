@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1（2026-09-17）
+
+- 增加单次运行总预算硬顶与参数校验，避免多 skill 评测累计超支
+- 增加报告路径脱敏工具、离线测试和 GitHub Actions
+- 收紧 token 成本与 Agent 兼容性表述，明确工程估算口径和实验性适配器
+
 ## 0.1.0（2026-09-17）
 
 首版。跨 agent skill 审计（claude-code / codex / hermes 插座式）。
