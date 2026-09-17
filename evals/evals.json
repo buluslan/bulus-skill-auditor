@@ -1,0 +1,29 @@
+{
+  "skill_name": "bulus-skill-auditor",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我审计一下我的 skills，先不花钱的那种",
+      "expected_output": "触发 skill-auditor；跑 collect+measure+render_report 三脚本；产出报告（含口径声明/真账单表/诊断明细/高嫌疑名单/处置建议）；不跑 eval 深度层；不删改任何文件；报告数字附复核命令",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "生成一份我的 skill 清单，我要看看我到底装了哪些",
+      "expected_output": "清单模式：产出 Skill清单.md；报告骨架照常渲染但诊断/建议注入位留空不写，分钟内完成",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "全面审计，包括对高嫌疑的跑深度验证，预算不超过 3 美元",
+      "expected_output": "静态层+预筛+受控 eval：先报价列出候选再跑（或按用户已给预算直接跑但给出成本上限保护）；02-eval-results.json 含 with/without/Δ/verdict；报告含成本段与'疑似原生覆盖'的疑似标注（不下死结论）",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "新模型发布了，重新扫一遍上次审计过的高嫌疑 skill",
+      "expected_output": "识别重扫场景：读取上次审计缓存（若有则只重跑受影响层，说明哪些沿用哪些重跑）；无缓存时诚实说明并按首次审计走",
+      "files": []
+    }
+  ]
+}

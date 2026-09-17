@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.mcp.json
+reports/
+output/
+.flow_state/
+cache/
+logs/
+*.log
+*.tmp
+skill-audit-output/
+.eval-tmp/
+eval-raw/
