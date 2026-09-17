@@ -1,7 +1,6 @@
 <div align="center">
 
-<!-- Banner: 把一张 banner 图放进 assets/banner.png 后,去掉下一行的注释即可显示 -->
-<!-- <img src="assets/banner.png" alt="bulus-skill-auditor" width="100%"> -->
+<img src="assets/banner.png" alt="skill 体检大师 banner" width="100%">
 
 # 🩺 skill 体检大师
 
