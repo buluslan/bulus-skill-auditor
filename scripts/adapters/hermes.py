@@ -1,143 +1,263 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""hermes 适配器（契约事实见 CONTRACT.md；S4 文档来源，本机未装——detect()=False 优雅跳过，代码备用）。
+"""Experimental read-only Hermes adapter.
 
-skill 根：$HERMES_HOME/skills/<category>/<skill>/SKILL.md（HERMES_HOME 是官方权威 resolver，勿硬编码；
-        也容忍无类别层直接 <skill>/SKILL.md）。external_dirs/profile/项目级(需 trust)暂不扫，见 notes。
-使用统计：$HERMES_HOME/state.db（SQLite，官方 schema）messages 表 tool_name='skill_view'。
-        文档 schema_version 迭代快，本适配器全 try 包裹：查询失败 → 无使用统计 + warning，不崩。
-        【注意】此路径本机未实测，装了 hermes 后先跑：
-        sqlite3 ~/.hermes/state.db '.schema messages' 核对再迭代（S4 建议）。
+No runtime authority probe exists yet, so filesystem discovery stays
+``active_state=unknown`` / ``discovery_confidence=inferred`` and must not be reported
+as confirmed-active inventory.  SQLite usage parsing degrades to structured issues.
 """
 import os
 import re
 import sqlite3
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import usage
+from . import make_issue, normalize_lexical_path
 from . import skillmd
 
 AGENT = "hermes"
 SCAN_WARNINGS = []
 USAGE_META = {}
-_CACHE = None
+_CACHE_RESULT = None
 _NAME_RE = re.compile(r"skill_view['\"\\\s,]*['\"]([A-Za-z0-9_.\-]+)['\"]")
+_VALID_DECLARED_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
-def _home():
-    v = os.environ.get("HERMES_HOME")
-    return Path(v) if v else Path.home() / ".hermes"
+def _home(home=None):
+    if home is not None:
+        return Path(home)
+    value = os.environ.get("HERMES_HOME")
+    return Path(value) if value else Path.home() / ".hermes"
 
 
-def detect():
-    return _home().is_dir()
+def detect(home=None):
+    return _home(home).is_dir()
 
 
-def skill_roots():
-    r = _home() / "skills"
-    return [str(r)] if r.is_dir() else []
+def _valid_declared_name(name):
+    return isinstance(name, str) and bool(_VALID_DECLARED_NAME.match(name))
 
 
-def iter_skills():
-    global _CACHE
-    SCAN_WARNINGS.clear()
+def _content_issues(raw_issues, path):
+    return [make_issue(
+        item.get("code", "component_parse_failed"), "warning", AGENT, "parse",
+        item.get("message", "component could not be parsed"),
+        path=item.get("path") or path,
+        safe_context=item.get("safe_context") or {},
+    ) for item in raw_issues]
+
+
+def _decorate(fact, runtime_name, scope, install_scope, source_kind):
+    auditable = os.path.isfile(fact["source_file"]) and _valid_declared_name(fact.get("declared_name"))
+    if not auditable:
+        listing = trigger = "excluded"
+        reason = "declared name missing/invalid or source unreadable"
+    else:
+        listing = trigger = "estimated"
+        reason = "inferred candidate; hermes runtime activation is unknown"
+    fact.update({
+        "agent": AGENT,
+        "name": runtime_name,
+        "runtime_name": runtime_name,
+        "component_name": runtime_name,
+        "namespace": None,
+        "scope": scope,
+        "install_scope": install_scope,
+        "source_kind": source_kind,
+        "active_state": "unknown",
+        "discovery_confidence": "inferred",
+        "discovery_method": "hermes filesystem scan (experimental)",
+        "plugin_id": None,
+        "plugin_name": None,
+        "marketplace": None,
+        "plugin_version": None,
+        "manifest_declared": None,
+        "auditable": auditable,
+        "accounting": {"listing": listing, "trigger": trigger, "reason": reason},
+    })
+    return fact
+
+
+def _skill_files(root):
+    """Collect <category>/<skill>/SKILL.md plus optional category-less entries."""
     out = []
-    root = _home() / "skills"
-    if not root.is_dir():
-        _CACHE = out
-        return out
     try:
-        with os.scandir(str(root)) as it:
-            tops = sorted(it, key=lambda e: e.name)
-    except OSError as e:
-        SCAN_WARNINGS.append("hermes: 无法列目录 %s（%s）" % (root, e))
-        _CACHE = out
+        tops = sorted(root.iterdir(), key=lambda path: path.name)
+    except OSError:
         return out
-    for top in tops:  # <category>/<skill>/SKILL.md；top 自带 SKILL.md 则视为无类别层
+    for top in tops:
         if top.name.startswith("."):
             continue
-        tp = Path(top.path)
-        if (tp / "SKILL.md").is_file():
-            entry, warns = skillmd.scan_skill_dir(tp, AGENT, "user")
-            out.append(entry)
-            SCAN_WARNINGS.extend(warns)
+        if top.is_file() and top.name == "SKILL.md":
+            out.append(top)
+            continue
+        if not top.is_dir():
+            continue
+        if (top / "SKILL.md").is_file():
+            out.append(top / "SKILL.md")
             continue
         try:
-            with os.scandir(str(tp)) as it:
-                subs = sorted(it, key=lambda e: e.name)
+            subs = sorted(top.iterdir(), key=lambda path: path.name)
         except OSError:
             continue
         for sub in subs:
-            if sub.name.startswith("."):
+            if sub.name.startswith(".") or not sub.is_dir():
                 continue
-            sp = Path(sub.path)
-            if (sp / "SKILL.md").is_file():
-                entry, warns = skillmd.scan_skill_dir(sp, AGENT, "user")
-                out.append(entry)
-                SCAN_WARNINGS.extend(warns)
-    _CACHE = out
+            if (sub / "SKILL.md").is_file():
+                out.append(sub / "SKILL.md")
     return out
 
 
-def usage_stats_available():
-    return (_home() / "state.db").is_file()
+def discover(home=None, cwd=None, runner=None):
+    """Scan the Hermes home read-only; results are inferred candidates only."""
+    global _CACHE_RESULT
+    home = _home(home)
+    issues = []
+    excluded = defaultdict(int)
+    rows = []
+    roots = []
+    skills_root = home / "skills"
+    if skills_root.is_dir():
+        roots.append(str(normalize_lexical_path(skills_root)))
+    for source in _skill_files(skills_root):
+        fact, raw_issues = skillmd.scan_component(source, "skill")
+        issues.extend(_content_issues(raw_issues, source))
+        declared = fact.get("declared_name")
+        if not _valid_declared_name(declared):
+            excluded["invalid_declared_name"] += 1
+            issues.append(make_issue(
+                "hermes_declared_name_invalid", "warning", AGENT, "parse",
+                "inferred candidate omitted because frontmatter name is missing or invalid",
+                path=source,
+            ))
+            continue
+        rows.append(_decorate(fact, declared, "user", "user", "standalone"))
+    rows.sort(key=lambda row: (row["runtime_name"], row["component_type"], row["source_file"]))
+    status = "complete" if skills_root.is_dir() else "unavailable"
+    if not skills_root.is_dir():
+        issues.append(make_issue(
+            "hermes_home_missing", "info", AGENT, "discovery",
+            "hermes skills root was not found",
+        ))
+    result = {
+        "skills": rows,
+        "skill_roots": sorted(set(roots)),
+        "issues": issues,
+        "discovery": {
+            "status": status,
+            "methods": ["hermes filesystem scan (experimental)"],
+            "cli_version": None,
+            "fallback_reason": None if skills_root.is_dir() else "skills_root_missing",
+            "excluded_counts": dict(sorted(excluded.items())),
+            "component_coverage": {"skill": len(rows), "command": 0, "agent": 0},
+        },
+    }
+    _CACHE_RESULT = result
+    SCAN_WARNINGS[:] = [issue["message"] for issue in issues
+                        if issue.get("severity") in ("warning", "error")]
+    return result
 
 
-def usage_records(window_days):
+def skill_roots():
+    return list((_CACHE_RESULT or discover())["skill_roots"])
+
+
+def iter_skills():
+    return [dict(row) for row in (_CACHE_RESULT or discover())["skills"]]
+
+
+def usage_stats_available(home=None):
+    return (_home(home) / "state.db").is_file()
+
+
+def usage_records(window_days, skills=None, home=None):
     USAGE_META.clear()
-    if _CACHE is None:
-        iter_skills()
-    names = {e["name"] for e in _CACHE}
-    db = _home() / "state.db"
-    agg, sessions = {}, 0
-    warns = []
+    if window_days <= 0:
+        raise ValueError("window_days must be positive")
+    if skills is None:
+        skills = (_CACHE_RESULT or discover())["skills"]
+    resolver = usage.build_name_resolver(skills, AGENT)
+    db = _home(home) / "state.db"
     if not db.is_file():
-        USAGE_META.update({"sessions_scanned": 0,
-                           "coverage": {"transcripts_found": False, "skip_env_detected": False},
-                           "warnings": ["hermes: state.db 不存在，使用统计不可用"]})
+        coverage = {
+            "status": "unavailable", "sessions_scanned": 0, "transcripts_found": False,
+            "history_disabled": False, "files_unreadable": 0, "parse_errors": 0,
+            "undated_events": 0, "direct_events": 0, "matched_activations": 0,
+            "unmatched_activations": 0, "ambiguous_activations": 0,
+            "limitations": ["state.db 不存在，使用统计不可用"],
+        }
+        USAGE_META.update({"sessions_scanned": 0, "coverage": coverage, "warnings": [], "issues": []})
         return []
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
     con = None
-    try:  # 只读打开（WAL 库官方建议）；任何 schema 漂移都降级为 warning
+    sessions = 0
+    rows = []
+    issues = []
+    try:
         con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
         con.row_factory = sqlite3.Row
         sessions = con.execute("SELECT COUNT(DISTINCT session_id) FROM messages").fetchone()[0]
         rows = con.execute(
             "SELECT timestamp, coalesce(tool_calls,'') AS tc, coalesce(content,'') AS c "
             "FROM messages WHERE tool_name = 'skill_view'").fetchall()
-        for r in rows:
-            ts = r["timestamp"]
-            dt = None
-            if isinstance(ts, (int, float)):  # 官方 schema 存 epoch 秒/毫秒的可能性都有
-                dt = datetime.fromtimestamp(ts / (1000 if ts > 1e11 else 1), tz=timezone.utc)
-            elif isinstance(ts, str):
-                dt = usage_parse_iso(ts)
-            if dt is None or dt < cutoff:
-                continue
-            for name in set(_NAME_RE.findall("%s %s" % (r["tc"], r["c"][:500]))):
-                if name in names:
-                    d = agg.setdefault(name, {"activations": 0, "first": None, "last": None})
-                    d["activations"] += 1
-                    ds = dt.date().isoformat()
-                    d["first"] = ds if d["first"] is None or ds < d["first"] else d["first"]
-                    d["last"] = ds if d["last"] is None or ds > d["last"] else d["last"]
-    except (sqlite3.Error, ValueError, OverflowError, OSError) as e:
-        warns.append("hermes: state.db 查询失败（%s），使用统计降级为不可用" % e)
-        agg, sessions = {}, 0
+    except (sqlite3.Error, ValueError, OverflowError, OSError) as exc:
+        issues.append(make_issue(
+            "hermes_usage_query_failed", "warning", AGENT, "usage",
+            "state.db 查询失败，使用统计降级为不可用",
+            safe_context={"error_type": type(exc).__name__},
+        ))
+        rows = []
+        sessions = 0
     finally:
         if con is not None:
             con.close()
-    recs = [{"skill_id": "%s::%s" % (AGENT, k), "activations": v["activations"],
-             "last_seen": v["last"], "first_seen": v["first"]} for k, v in agg.items()]
-    recs.sort(key=lambda r: (-r["activations"], r["skill_id"]))
-    USAGE_META.update({"sessions_scanned": sessions, "warnings": warns,
-                       "coverage": {"transcripts_found": sessions > 0, "skip_env_detected": False}})
-    return recs
-
-
-def usage_parse_iso(ts):
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    agg = usage._Aggregator(AGENT)
+    undated = 0
+    parse_errors = 0
+    for row in rows:
+        timestamp = row["timestamp"]
+        dt = None
+        if isinstance(timestamp, (int, float)):
+            try:
+                dt = datetime.fromtimestamp(timestamp / (1000 if timestamp > 1e11 else 1),
+                                            tz=timezone.utc)
+            except (ValueError, OverflowError, OSError):
+                dt = None
+        elif isinstance(timestamp, str):
+            dt = usage.parse_iso(timestamp)
+        names = set()
+        try:
+            names = set(_NAME_RE.findall("%s %s" % (row["tc"], row["c"][:500])))
+        except (TypeError, ValueError):
+            parse_errors += 1
+        for name in sorted(names):
+            agg.direct_events += 1
+            if dt is None:
+                undated += 1
+                continue
+            if dt < cutoff:
+                continue
+            result = resolver.resolve(name)
+            agg.add(result, "skill_view", name, dt, name)
+    matched, unmatched, ambiguous = agg.counts()
+    coverage = {
+        "status": "complete" if sessions else "unavailable",
+        "sessions_scanned": sessions,
+        "transcripts_found": bool(sessions),
+        "history_disabled": False,
+        "files_unreadable": 0,
+        "parse_errors": parse_errors,
+        "undated_events": undated,
+        "direct_events": agg.direct_events,
+        "matched_activations": matched,
+        "unmatched_activations": unmatched,
+        "ambiguous_activations": ambiguous,
+        "limitations": [],
+    }
+    if not sessions:
+        coverage["limitations"].append("state.db 无会话记录，无法区分零使用与数据不可用")
+    USAGE_META.update({"sessions_scanned": sessions, "coverage": coverage,
+                       "warnings": [], "issues": issues})
+    return agg.records()

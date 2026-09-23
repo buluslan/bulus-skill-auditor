@@ -182,7 +182,8 @@ def _dir_stats(sub, root):
             if fn.startswith("."):
                 continue
             fp = os.path.join(dirpath, fn)
-            files.append(os.path.relpath(fp, str(root)))  # B1：原为相对 sub 的裸文件名，导致 measure 拼路径全部 FileNotFoundError
+            # 路径相对 skill 根产出（带 references/、scripts/ 前缀），与数据契约的形态一致
+            files.append(os.path.relpath(fp, str(root)))
             try:
                 total += len(read_text(fp))
             except OSError:
@@ -190,40 +191,97 @@ def _dir_stats(sub, root):
     return sorted(files), total
 
 
-def scan_skill_dir(path, agent, scope):
-    """扫描一个 skill 目录，返回 (契约 skills[] 单条 dict, warnings 列表)。100% 只读。"""
-    p = Path(path)
-    entry = {
-        "id": "%s::%s" % (agent, p.name),
-        "agent": agent,
-        "name": p.name,
-        "path": str(p),
-        "symlink_target": os.path.realpath(str(p)) if os.path.islink(str(p)) else None,
-        "scope": scope,
+def _component_root(source_file, component_type):
+    """Return the content root without assigning any runtime identity."""
+    source = Path(source_file)
+    if component_type == "skill" and source.name == "SKILL.md":
+        return source.parent
+    return source.parent
+
+
+def scan_component(source_file, component_type):
+    """Read one explicitly discovered component and return content facts only.
+
+    Discovery adapters own runtime names, scopes, plugin identity, and active state.  This
+    parser deliberately knows none of those concepts.  ``source_file`` is kept lexical
+    while ``source_realpath`` records the physical target so collect can build a stable
+    instance identity later.
+    """
+    if component_type not in ("skill", "command", "agent"):
+        raise ValueError("unsupported component_type: %s" % component_type)
+    source = Path(os.path.abspath(os.path.normpath(str(source_file))))
+    root = _component_root(source, component_type)
+    source_realpath = os.path.realpath(str(source))
+    root_realpath = os.path.realpath(str(root))
+    fact = {
+        "component_type": component_type,
+        "declared_name": None,
+        "directory_name": root.name,
+        "path": str(root),
+        "realpath": root_realpath,
+        "source_file": str(source),
+        "source_realpath": source_realpath,
+        "symlink_target": root_realpath if str(root) != root_realpath else None,
         "description": "",
-        "has_skill_md": False,
+        "has_skill_md": component_type == "skill" and source.is_file(),
         "body_chars": 0,
         "body_lines": 0,
         "ref_files": [],
         "ref_total_chars": 0,
         "scripts_files": [],
         "frontmatter_keys": [],
+        "source_format": "skill-md" if component_type == "skill" else "markdown",
     }
-    warns = []
-    sm = p / "SKILL.md"
-    if sm.is_file():
-        entry["has_skill_md"] = True
-        try:
-            meta, body, keys = parse_frontmatter(read_text(sm))
-            entry["description"] = str(meta.get("description", "")).strip()
-            entry["body_chars"] = len(body)
-            entry["body_lines"] = len(body.splitlines())
-            entry["frontmatter_keys"] = keys
-        except SkillMDParseError as e:
-            # 官方口径：frontmatter 坏 = 字段全丢且零警告、name 回退目录名——审计层必须显性标出
-            warns.append("%s: frontmatter 坏（%s），官方会静默丢弃字段" % (entry["id"], e))
-        except OSError as e:
-            warns.append("%s: SKILL.md 读不了（%s），仅计文件层" % (entry["id"], e))
-    entry["ref_files"], entry["ref_total_chars"] = _dir_stats(p / "references", p)  # B1：基准改 skill 根
-    entry["scripts_files"], _ = _dir_stats(p / "scripts", p)
-    return entry, warns
+    issues = []
+    if not source.is_file():
+        issues.append({
+            "code": "component_source_missing",
+            "message": "component source file is not readable",
+            "path": str(source),
+            "safe_context": {"component_type": component_type},
+        })
+        return fact, issues
+    try:
+        text = read_text(source)
+        meta, body, keys = parse_frontmatter(text)
+        declared = meta.get("name")
+        fact["declared_name"] = str(declared).strip() if declared is not None and str(declared).strip() else None
+        fact["description"] = str(meta.get("description", "")).strip()
+        fact["body_chars"] = len(body)
+        fact["body_lines"] = len(body.splitlines())
+        fact["frontmatter_keys"] = keys
+    except SkillMDParseError as exc:
+        # Claude/Codex drop malformed frontmatter fields; keep the file-level facts.
+        fact["body_chars"] = len(text)
+        fact["body_lines"] = len(text.splitlines())
+        issues.append({
+            "code": "frontmatter_invalid",
+            "message": "frontmatter is structurally invalid; declared fields were ignored",
+            "path": str(source),
+            "safe_context": {"detail": str(exc)[:200]},
+        })
+    except OSError as exc:
+        fact["has_skill_md"] = False
+        issues.append({
+            "code": "component_read_failed",
+            "message": "component source file could not be read",
+            "path": str(source),
+            "safe_context": {"error_type": type(exc).__name__},
+        })
+        return fact, issues
+
+    if component_type == "skill":
+        fact["ref_files"], fact["ref_total_chars"] = _dir_stats(root / "references", root)
+        fact["scripts_files"], _ = _dir_stats(root / "scripts", root)
+    return fact, issues
+
+
+def scan_skill_dir(path, agent=None, scope=None):
+    """Backward-compatible directory entry point.
+
+    ``agent`` and ``scope`` remain accepted for v1 callers, but identity and active-state
+    decisions intentionally stay in the discovery adapter/collector.
+    """
+    fact, issues = scan_component(Path(path) / "SKILL.md", "skill")
+    warnings = ["%s (%s)" % (item["message"], item.get("path") or "unknown") for item in issues]
+    return fact, warnings

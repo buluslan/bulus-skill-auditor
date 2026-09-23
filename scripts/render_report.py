@@ -1,297 +1,812 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""render_report.py — 报告骨架渲染器（两段式产出的骨架层，修复审核 M3 及其后果 B3/M1/M2/M5/M6）
+"""Render a deterministic, per-Agent audit report from v2 artifacts.
 
-从 01-metrics.json（可选并入 00-inventory.json 的 usage、02-eval-results.json）渲染 03-report.md 骨架：
-口径声明、总览聚合、真账单全表、重复对统计、高嫌疑表、失配警示、复核命令附录。全部数字由脚本从
-输入聚合计算，禁止手算聚合进报告（B3）；重跑等价（日期取自输入，不取当前时间）。判断层只输出
-INJECT 占位注释；存在 report-inject.json（{"sections": {"diagnosis": "...", "recommendations": "...",
-"suspect_actions": "...", "inventory_list": "..."}}）则填入——重跑骨架不丢判断层（report-format.md）。
-骨架防住的错误类型（红队审核 2026-09-17）：B3 冗余 token 只从 duplication 聚合，不做"对数×平均"估算；
-M1 终身计数分侧（claude-code 侧"无 skillUsage 条目=推断终身 0"≠官方硬信号；codex 侧"窗口 0 激活、
-无终身数据源"分开统计分开表述）；M2 闲置算术链直接给分侧原始数；M5 真账单 8 列由代码构造保证；
-M6 description 超长统一"超本工具 1024 警戒线（官方硬上限 1536，尚未触及）"；失配警示机械化
-（usage 覆盖异常 / listing 超预算 / metrics_meta 与重算不一致 → 顶部警示行；0 个 skill → 报错不出报告）。
-只读输入；唯一写操作是 --out 与 --inventory-list。Python 3.9+ 标准库。
-用法：python3 scripts/render_report.py --metrics 01-metrics.json [--inventory 00-inventory.json]
-      [--eval 02-eval-results.json] --out 03-report.md [--inventory-list Skill清单.md] [--inject ...] [--json]
+The renderer never merges listing bills across Agents.  It consumes explicit discovery,
+accounting, usage, and eval states; legacy inputs are boundary-adapted as inferred only.
 """
 import argparse
+import copy
+import hashlib
 import json
 import os
 import shlex
 import sys
 from collections import Counter, defaultdict
 
-LISTING_BUDGET = 2000       # 契约：claude-code listing 预算 = 上下文×1%（200k→~2000 token≈官方 8000 字符，官方口径）；全部 always 之和超过 → 报告层警示（静默截断风险）
-CONTEXT_WINDOW = 200000     # 仅百分比换算口径，报告内注明
-NEAR_BUDGET_RATIO = 0.8     # ≥ 预算 80% 记"接近"（本工具自定义档，报告内注明）
-MIN_SESSIONS = 10           # 会话文件数低于此值 → usage 覆盖异常警示
-OVERSIZE_TOOL, OVERSIZE_OFFICIAL = 1024, 1536  # 自家警戒线 / 官方硬上限（措辞不混用，M6）
-FLAG_LABEL = {"oversized_description": "desc超长", "heavy_body_no_refs": "超重无refs", "skeleton": "骨架"}
-VERDICT_LABEL = {"suspected_native_coverage": "疑似模型已原生覆盖（须人工复核）", "valuable": "有价值（保留）", "inconclusive": "无结论"}
-WARN_KINDS = [("重复出现", "跨根/多根重复去重"), ("ref 文件读取失败", "ref 读取失败"), ("未安装", "未安装跳过"),
-              ("frontmatter", "frontmatter 解析失败"), ("未匹配", "使用记录未匹配")]
+METRICS_SCHEMA_NAME = "bulus-skill-auditor.metrics"
+INVENTORY_SCHEMA_NAME = "bulus-skill-auditor.inventory"
+EVAL_SCHEMA_NAME = "bulus-skill-auditor.eval"
+SUPPORTED_MAJORS = (1, 2)
+CLAUDE_LISTING_BUDGET = 2000
+CONTEXT_WINDOW = 200000
+FLAG_LABEL = {
+    "oversized_description": "desc超长",
+    "heavy_body_no_refs": "超重无refs",
+    "skeleton": "骨架",
+}
+VERDICT_LABEL = {
+    "suspected_native_coverage": "疑似模型已原生覆盖（须人工复核）",
+    "valuable": "有价值（保留）",
+    "inconclusive": "无结论",
+    "content_value_unverified": "内容价值未验证",
+}
 
 
 def load(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def cell(v):
-    """表格单元格：None→—，竖线转义保证列数不被内容破坏（M5）。"""
-    return ("—" if v is None else str(v)).replace("|", "\\|")
-def fmt(n):
-    return f"{n:,}"
-def tok(s, key):
-    return (s.get("tokens") or {}).get(key) or 0
-def act(s):
-    return (s.get("usage_stats") or {}).get("activations") or 0
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
-def aggregate(skills, usage):
-    """全部总览/诊断数字的唯一计算点（骨架数字禁止散落手算）。"""
-    by_id = {s["id"]: s for s in skills}
-    a = {"by_id": by_id, "by_agent": Counter(s["agent"] for s in skills), "scope": defaultdict(Counter),
-         "flags": Counter(f for s in skills for f in s.get("structure_flags") or []),
-         "always_total": sum(tok(s, "always") for s in skills),
-         "refs_total": sum(tok(s, "refs_total") for s in skills),
-         "zero_act": [s for s in skills if act(s) == 0]}
-    for s in skills:
-        a["scope"][s["agent"]][s.get("scope") or "unknown"] += 1
-    zero, recs = a["zero_act"], {r["skill_id"]: r for r in (usage or {}).get("records", [])}
-    a["cc_infer0"] = [s for s in zero if s["agent"] == "claude-code" and s["id"] not in recs]  # M1 分侧
-    a["cx_nolifetime"] = [s for s in zero if s["agent"] != "claude-code"]                      # M1 分侧
-    a["lifetime_entries"] = sum(1 for r in recs.values() if r.get("lifetime_count") is not None)
-    a["unmatched_records"] = len([i for i in recs if i not in by_id])
-    cross_name, rename = set(), {}   # 重复对只从 duplication 聚合（B3），对按有序 id 去重
-    for s in skills:
-        for d in s.get("duplication") or []:
-            w = d.get("with")
-            if w and w != s["id"]:
-                key = tuple(sorted((s["id"], w)))
-                if d.get("note") == "跨 agent 同名":
-                    cross_name.add(key)
-                else:
-                    rename[key] = max(rename.get(key, 0.0), d.get("jaccard") or 0.0)
-    a["cross_name"], a["rename"] = cross_name, rename
-    a["cx_dup_ids"] = {i for p in cross_name for i in p if i in by_id and by_id[i]["agent"] == "codex"}
-    a["cx_dup_always"] = sum(by_id[i]["tokens"]["always"] for i in a["cx_dup_ids"])
-    a["dup_both_always"] = sum(by_id[i]["tokens"]["always"] for p in cross_name for i in p if i in by_id)
-    a["rename_cross"] = {k: v for k, v in rename.items() if k[0] in by_id and k[1] in by_id and by_id[k[0]]["agent"] != by_id[k[1]]["agent"]}
-    a["rename_inner"] = {k: v for k, v in rename.items() if k not in a["rename_cross"]}
-    ranked = sorted(skills, key=lambda s: (-(s.get("priority") or {}).get("score") or 0, s["id"]))
-    a["suspects"] = [s for s in ranked if s["id"] not in a["cx_dup_ids"]][:15]  # 排除 codex 侧副本
-    return a
+def _text(value, default=""):
+    return value if isinstance(value, str) else default
 
 
-def render(metrics, usage_src, usage, ev, inject, a):
-    """返回报告行列表，按 references/report-format.md 结构拼接。"""
-    skills, L, m = metrics["skills"], [], metrics
-    mpath, upath = shlex.quote(metrics.get("_path", "")), shlex.quote(usage_src)
-    date, ag = (m.get("generated_at") or "")[:10] or "unknown", m.get("agents") or []
-    cov = (usage or {}).get("coverage") or {}
-    sessions = (usage or {}).get("sessions_scanned") or 0
-    bad_usage = ((not usage) or cov.get("transcripts_found") is False
-                 or cov.get("skip_env_detected") or sessions < MIN_SESSIONS)
-    ratio = a["always_total"] / LISTING_BUDGET
-    meta_total = (m.get("metrics_meta") or {}).get("always_total_tokens")
+def _count(value):
+    """Coerce an untrusted counter to int; malformed values degrade to 0, never crash."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    return 0
 
-    L += [f"# Skill 审计报告 · {date}", ""]
-    warns = ([] if not bad_usage else
-             ["使用数据不完整（会话扫描覆盖异常）：本报告所有“零激活/闲置”结论不可信（须人工复核）"])
-    warns += ([] if ratio <= 1 else
-              [f"listing 超预算：常驻 {fmt(a['always_total'])} / {fmt(LISTING_BUDGET)} token = {ratio:.1f} 倍"
-               "——超限会静默截断，排在后面的 skill 从模型视野消失"])
-    if meta_total is not None and meta_total != a["always_total"]:
-        warns.append(f"数据失配：metrics_meta.always_total_tokens={fmt(meta_total)} 与重算值 {fmt(a['always_total'])}"
-                     " 不一致——以复核命令重算值为准（须人工复核）")
-    if warns:
-        L += ["> **⚠️ 失配警示（脚本机械检查插入）**"] + [f"> - {w}" for w in warns] + [""]
-    cost = (f"${sum(r.get('cost_usd') or 0 for r in ev['results']):.2f}（深度评测 {len(ev['results'])} 个 skill，"
-            f"预算上限 ${ev.get('budget_usd', '?')}）" if ev else "$0（未跑深度评测）")
-    detected = " / ".join(x["agent"] for x in ag if x.get("detected")) or "无"
-    skipped = "；".join(x["agent"] + " 未安装，跳过" for x in ag if not x.get("detected"))
-    wcount = f"；{fmt(len(m.get('warnings') or []))} 条 warnings（分类见附录）" if m.get("warnings") else ""
-    L += ["> 口径声明（脚本固定渲染，数据诚实原则）：",
-          "> - token 为本地计量（o200k_local），与官方 tokenizer 偏差 ≤10%",
-          "> - always 口径只计 description、不含 name 字段（官方 listing 实为 name+description 一行，常驻因此系统性低估）",
-          f"> - 使用统计窗口：最近 {(usage or {}).get('window_days') or '?'} 天（transcripts 扫描，扫 {sessions} 个会话文件）；"
-          "终身计数仅 claude-code 侧有数据源（~/.claude.json skillUsage），codex 侧无终身数据源",
-          f"> - 覆盖率：{detected} 已扫描" + (f"；{skipped}" if skipped else "") + wcount,
-          f"> - 本次审计花费：{cost}", ""]
 
-    L += ["## 一、总览（骨架：全部数字由脚本从 01-metrics.json 聚合，重跑等价）", ""]
-    dist = "；".join(f"{g} {a['by_agent'][g]} = " + " + ".join(f"{sc} {n}" for sc, n in sorted(a["scope"][g].items())) for g in sorted(a["by_agent"]))
-    L += [f"- {len(skills)} 个 skill，分布：{dist}",
-          f"- 常驻总账：每次会话固定承载 {fmt(a['always_total'])} token（≈ 200K 上下文的 "
-          f"{a['always_total'] / CONTEXT_WINDOW * 100:.1f}%，按 {fmt(CONTEXT_WINDOW)} 窗口换算；always 口径不含 name）"]
-    if ratio > 1:
-        L.append(f"- listing 预算状态：**超限——{fmt(a['always_total'])} / {fmt(LISTING_BUDGET)} = {ratio:.1f} 倍**"
-                 "（超限会静默截断，排在后面的 skill 从模型视野消失）")
+def _major(document):
+    raw = document.get("schema_version")
+    if raw in (None, ""):
+        return 1
+    try:
+        return int(str(raw).split(".", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _schema_supported(document, expected_name):
+    if not isinstance(document, dict):
+        # json.load 合法产出数组/字符串/数字；对契约输入必须是 object——干净拒绝不崩溃
+        return False, "输入顶层必须是 JSON object，实际是 %s" % type(document).__name__
+    major = _major(document)
+    if major not in SUPPORTED_MAJORS:
+        return False, "不支持 schema major %s（仅支持 v1 兼容输入和 v2）" % document.get("schema_version")
+    if major == 2 and document.get("schema_name") not in (None, expected_name):
+        return False, "不支持 schema_name %s（期望 %s）" % (document.get("schema_name"), expected_name)
+    return True, ""
+
+
+def safe_text(value):
+    """Keep untrusted names/reasons inside one Markdown table cell or list line."""
+    if value is None:
+        return "—"
+    text = str(value).replace("\x00", "�").replace("\r\n", "\n").replace("\r", "\n")
+    text = "".join(char if char == "\n" or char == "\t" or ord(char) >= 32 else "�" for char in text)
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
+
+def cell(value):
+    return safe_text(value)
+
+
+def inline_code(value):
+    text = safe_text(value).replace("`", "\\`")
+    return "`%s`" % text
+
+
+def fmt(value):
+    if not isinstance(value, (int, float)):
+        return "未确认"
+    if isinstance(value, float) and not value.is_integer():
+        return "%g" % value
+    return format(int(value), ",")
+
+
+def money(value):
+    return "$%.2f" % value if isinstance(value, (int, float)) else "未知"
+
+
+def tok(skill, key):
+    value = (skill.get("tokens") or {}).get(key)
+    return value if isinstance(value, (int, float)) else None
+
+
+def act(skill):
+    stats = skill.get("usage_stats")
+    if not isinstance(stats, dict):
+        return None
+    value = stats.get("activations")
+    return value if isinstance(value, (int, float)) else None
+
+
+def _legacy_instance_id(skill, ordinal, duplicate=False):
+    logical = _text(skill.get("id") or skill.get("logical_id"))
+    if logical and not duplicate:
+        return logical
+    fields = [
+        _text(skill.get("agent"), "unknown"),
+        _text(skill.get("component_type"), "skill"),
+        _text(skill.get("runtime_name") or skill.get("name") or logical, "unknown"),
+        _text(skill.get("source_file") or skill.get("path")),
+        str(ordinal),
+    ]
+    digest = hashlib.sha256("\0".join(fields).encode("utf-8", errors="replace")).hexdigest()[:20]
+    return "%s::legacy::%s" % (fields[0], digest)
+
+
+def adapt_metrics(document):
+    """Return a copy with safe transition defaults; missing evidence never becomes confirmed."""
+    metrics = copy.deepcopy(document)
+    legacy = _major(metrics) == 1
+    raw_skills = [item for item in (metrics.get("skills") or []) if isinstance(item, dict)]
+    logical_counts = Counter(_text(item.get("logical_id") or item.get("id")) for item in raw_skills)
+    used = set()
+    skills = []
+    for ordinal, raw in enumerate(raw_skills):
+        skill = dict(raw)
+        agent = _text(skill.get("agent"), "unknown")
+        runtime_name = _text(skill.get("runtime_name") or skill.get("name") or skill.get("id"), "unknown")
+        logical_id = _text(skill.get("logical_id") or skill.get("id"), "%s::%s" % (agent, runtime_name))
+        instance_id = _text(skill.get("instance_id"))
+        if not instance_id:
+            instance_id = _legacy_instance_id(skill, ordinal, logical_counts[logical_id] > 1)
+        if instance_id in used:
+            instance_id = _legacy_instance_id(skill, ordinal, True)
+        used.add(instance_id)
+        skill.update({
+            "instance_id": instance_id,
+            "id": logical_id,
+            "logical_id": logical_id,
+            "agent": agent,
+            "runtime_name": runtime_name,
+            "name": runtime_name,
+            "component_type": _text(skill.get("component_type"), "skill"),
+        })
+        accounting = skill.get("accounting") if isinstance(skill.get("accounting"), dict) else {}
+        tokens = dict(skill.get("tokens") or {})
+        if legacy:
+            skill["active_state"] = "unknown"
+            accounting = {
+                "listing": "excluded" if accounting.get("listing") == "excluded" else "estimated",
+                "trigger": "excluded" if accounting.get("trigger") == "excluded" else "estimated",
+                "reason": "legacy v1 input: runtime activity is not proved",
+            }
+            if tokens.get("accounting_status") != "excluded":
+                tokens["accounting_status"] = "inferred"
+        else:
+            if skill.get("active_state") not in ("active", "unknown"):
+                skill["active_state"] = "unknown"
+            accounting = {
+                "listing": accounting.get("listing") if accounting.get("listing") in ("confirmed", "estimated", "excluded") else "estimated",
+                "trigger": accounting.get("trigger") if accounting.get("trigger") in ("confirmed", "estimated", "excluded") else "estimated",
+                "reason": _text(accounting.get("reason"), "transition default: evidence missing"),
+            }
+            if tokens.get("accounting_status") not in ("confirmed", "inferred", "excluded"):
+                tokens["accounting_status"] = "inferred"
+        if tokens.get("measurement_status") not in ("complete", "incomplete", "excluded"):
+            tokens["measurement_status"] = "complete" if isinstance(tokens.get("on_trigger"), (int, float)) else "incomplete"
+        skill["accounting"] = accounting
+        skill["tokens"] = tokens
+        skills.append(skill)
+    metrics["skills"] = sorted(skills, key=lambda item: item["instance_id"])
+    return metrics, legacy
+
+
+def _usage_coverage(usage, agents):
+    coverage = {}
+    raw = (usage or {}).get("coverage") if isinstance(usage, dict) else None
+    by_agent = raw.get("by_agent") if isinstance(raw, dict) else None
+    if isinstance(by_agent, dict):
+        for agent, detail in by_agent.items():
+            status = detail.get("status") if isinstance(detail, dict) else None
+            coverage[agent] = status if status in ("complete", "partial", "unavailable") else "unavailable"
     else:
-        st = "接近（≥预算 80%，本工具自定义档）" if ratio >= NEAR_BUDGET_RATIO else "健康"
-        L.append(f"- listing 预算状态：{st}（{fmt(a['always_total'])} / {fmt(LISTING_BUDGET)}）")
-    L += [f"- 30 天零激活：{len(a['zero_act'])} 个" + ("（usage 覆盖异常，数据不足，该结论不可信）" if bad_usage else "")
-          + f"；其中 claude-code 侧 {len(a['cc_infer0'])} 个无 skillUsage 条目（推断终身 0，非官方 usageCount===0 硬信号）"
-            f"、codex 侧 {len(a['cx_nolifetime'])} 个窗口 0 激活且无终身数据源",
-          "- 结构问题：" + (" / ".join(f"{FLAG_LABEL.get(f, f)} {a['flags'][f]} 个" for f in sorted(a["flags"])) or "无")
-          + f"（description 超长=超本工具 {OVERSIZE_TOOL} 警戒线，官方硬上限 {OVERSIZE_OFFICIAL}）",
-          f"- 重复：跨 agent 同名 {len(a['cross_name'])} 对（codex 侧副本常驻合计 {fmt(a['cx_dup_always'])} token/会话，"
-          f"为两份合计 {fmt(a['dup_both_always'])} 中冗余的一份）；换名疑似重复（须人工复核）{len(a['rename'])} 对，"
-          f"其中跨 agent {len(a['rename_cross'])} 对", ""]
-
-    L += [f"## 二、真账单（骨架：全量 {len(skills)} 行按常驻降序；refs=按需加载参考值；8 列由代码保证）", "",
-          "| skill | agent | 常驻token | 触发token | refs | 30天激活 | 最后使用 | 标记 |",
-          "|---|---|---|---|---|---|---|---|"]
-    for s in sorted(skills, key=lambda x: (-tok(x, "always"), x["id"])):
-        seen = (s.get("usage_stats") or {}).get("last_seen_days_ago")
-        row = [s["name"], s["agent"], fmt(tok(s, "always")), fmt(tok(s, "on_trigger")), fmt(tok(s, "refs_total")),
-               act(s), "—" if seen is None else ("今天" if seen == 0 else f"{seen} 天前"),
-               "+".join(FLAG_LABEL.get(f, f) for f in s.get("structure_flags") or []) or "—"]
-        L.append("| " + " | ".join(cell(x) for x in row) + " |")
-    L.append("")
-
-    L += ["## 三、诊断明细（骨架事实 + 注入判断）", "",
-          f"### 重复（跨 agent 同名 {len(a['cross_name'])} 对 + 换名 {len(a['rename'])} 对，人工确认级）"]
-    tops = sorted(((a["by_id"][i]["tokens"]["always"], a["by_id"][i]["name"]) for i in a["cx_dup_ids"]), reverse=True)
-    L += [f"- 跨 agent 同名 {len(a['cross_name'])} 对：同一 skill 两侧各装一份物理副本（Jaccard=1.00）。codex 侧"
-          f"副本常驻合计 {fmt(a['cx_dup_always'])} token，两份合计 {fmt(a['dup_both_always'])}，冗余的一份即"
-          f"{fmt(a['cx_dup_always'])}。常驻降序 top10：" + "、".join(f"{n}（{fmt(t)} tok）" for t, n in tops[:10])]
-    rk = sorted(a["rename"].items(), key=lambda kv: (-kv[1], kv[0]))[:5]
-    ik = sorted(a["rename_inner"].items(), key=lambda kv: (-kv[1], kv[0]))[:5]
-    L += [f"- 换名疑似重复（须人工复核）{len(a['rename'])} 对（跨 agent {len(a['rename_cross'])} / agent 内部 "
-          f"{len(a['rename_inner'])}），Jaccard top5：" + "、".join(f"{x} ↔ {y}（{j:.2f}）" for (x, y), j in rk)]
-    if ik:
-        L.append("- agent 内部重复 top5：" + "、".join(f"{x} ↔ {y}（{j:.2f}）" for (x, y), j in ik))
-    L += ["", "### 疑似过时 / 模型已原生覆盖"]
-    if ev:
-        vc = Counter(r.get("verdict") for r in ev["results"])
-        L.append("- 已跑深度评测（明细见第六节）：" + " / ".join(
-            f"{VERDICT_LABEL.get(v, v)} {n} 个" for v, n in sorted(vc.items())))
-    else:
-        L.append("- 未验证，跑深度评测可得（evaluate.py，报价见 SKILL.md 深度层）")
-    heavy = sorted((s for s in skills if "heavy_body_no_refs" in (s.get("structure_flags") or [])),
-                   key=lambda s: -tok(s, "on_trigger"))
-    ov = [s for s in skills if "oversized_description" in (s.get("structure_flags") or [])]
-    L += ["### 超重 / 结构问题",
-          f"- 超重无 refs {len(heavy)} 个，最重 top5：" + "、".join(f"{s['name']}（{fmt(tok(s, 'on_trigger'))} tok）" for s in heavy[:5]),
-          f"- description 超长 {len(ov)} 个：" + ("；".join(
-              f"{s['name']}（{s['agent']}，{len(s.get('description') or '')} 字符，超本工具 {OVERSIZE_TOOL} 警戒线"
-              f"——官方硬上限 {OVERSIZE_OFFICIAL}，尚未触及）" for s in ov) if ov else "无"),
-          f"- 骨架 {a['flags'].get('skeleton', 0)} 个（<50 行且无 refs/scripts，可能是空壳或半成品）", "### 健康",
-          f"- 在用（30 天有激活）且无结构问题 {sum(1 for s in skills if act(s) > 0 and not (s.get('structure_flags') or []))}"
-          " 个，一句带过（明细见 metrics）", ""]
-    L += ([inject["diagnosis"], ""] if inject.get("diagnosis") else
-          ["<!-- INJECT: 诊断明细（Agent 按 references/audit-rubric.md 判读后写这里：重复对逐对判断、"
-           "结构问题定性、健康面归纳）-->", ""])
-
-    L += ["## 四、高嫌疑名单（骨架：priority 降序 top15，已排除跨 agent 同名对的 codex 侧副本；score 与 reasons 同现）", "",
-          "| # | skill | agent | score | 上榜信号（reasons） |", "|---|---|---|---|---|"]
-    for i, s in enumerate(a["suspects"], 1):
-        p = s.get("priority") or {}
-        L.append(f"| {i} | {cell(s['name'])} | {cell(s['agent'])} | {p.get('score', '—')} | "
-                 f"{cell('；'.join(p.get('reasons') or []))} |")
-    L += (["", inject["suspect_actions"], ""] if inject.get("suspect_actions") else ["", "<!-- INJECT: 高嫌疑“建议动作”列（Agent 逐行补：对应 R1-R6 哪条、先评测还是先改造）-->", ""])
-    L += ["## 五、处置建议（注入位）", ""]
-    L += ([inject["recommendations"], ""] if inject.get("recommendations") else ["<!-- INJECT: 处置建议（Agent 按 references/refactor-playbook.md 的 R1-R6 逐条写：信号 / 预计收益 / 风险前提 / [ ] 建议人工确认）-->", ""])
-
-    if ev:
-        L += ["## 六、深度评测结果（骨架，来自 02-eval-results.json）", "",
-              f"- 模型：{ev.get('model', '?')}｜runs/case：{ev.get('runs', '?')}｜预算：${ev.get('budget_usd', '?')}"
-              f"｜实际花费：${sum(r.get('cost_usd') or 0 for r in ev['results']):.2f}"
-              f"{'｜dry-run' if ev.get('dry_run') else ''}｜口径：{ev.get('cost_note', '')}", "",
-              "| skill | 预筛 | cases | with | without | Δ | 判定 |", "|---|---|---|---|---|---|---|"]
-        for r in ev["results"]:
-            cs = r.get("cases") or []
-            avg = lambda k: (sum(c.get(k) or 0 for c in cs) / len(cs)) if cs else None  # noqa: E731
-            w, o = avg("with_score"), avg("without_score")
-            L.append(f"| {cell(r['skill_id'])} | {cell((r.get('prescreen') or {}).get('verdict'))} | {len(cs)} | "
-                     f"{cell(f'{w:.2f}' if w is not None else None)} | {cell(f'{o:.2f}' if o is not None else None)} | "
-                     f"{cell(f'{w - o:+.2f}' if w is not None and o is not None else None)} | "
-                     f"{cell(VERDICT_LABEL.get(r.get('verdict'), r.get('verdict')))} |")
-        L += [""] + [f"- {r['skill_id']}：{r.get('evidence', '')}" for r in ev["results"]] + [""]
-
-    wc = Counter(next((k for p, k in WARN_KINDS if p in w), "其他") for w in m.get("warnings") or [])
-    cmds = [("- 常驻总账（口径：仅 description）", f"jq '[.skills[].tokens.always] | add' {mpath}"),
-            ("- 与 metrics_meta 对账", f"jq '.metrics_meta.always_total_tokens' {mpath}"),
-            ("- 各 agent skill 数", f"jq '.skills | group_by(.agent) | map({{agent:.[0].agent,n:length}})' {mpath}"),
-            ("- flags 计数", f"jq '[.skills[].structure_flags[]] | group_by(.) | map({{flag:.[0],n:length}})' {mpath}"),
-            ("- 30 天零激活数", f"jq '[.skills[] | select((.usage_stats.activations // 0)==0)] | length' {mpath}"),
-            ("- claude-code 侧无 skillUsage 条目（推断终身 0）", f"jq '[.usage.records[].skill_id] as $r | [.skills[] | select(.agent==\"claude-code\") | select(.id as $i | $r | index($i) | not)] | length' {upath}"),
-            ("- codex 侧零激活（无终身数据源）", f"jq '[.skills[] | select(.agent==\"codex\") | select((.usage_stats.activations // 0)==0)] | length' {mpath}"),
-            ("- 跨 agent 同名对数", f"jq '[.skills[].duplication[]? | select(.note==\"跨 agent 同名\")] | length/2' {mpath}"),
-            ("- codex 侧副本冗余常驻", f"jq '[.skills[] | select(.agent==\"codex\") | select(any(.duplication[]?; .note==\"跨 agent 同名\")) | .tokens.always] | add' {mpath}"),
-            ("- 两份合计常驻", f"jq '[.skills[] | select(any(.duplication[]?; .note==\"跨 agent 同名\")) | .tokens.always] | add' {mpath}"),
-            ("- refs 合计", f"jq '[.skills[].tokens.refs_total] | add' {mpath}"),
-            ("- description 字符数核对（以 claude-api 为例）", f"jq '.skills[] | select(.name==\"claude-api\") | .description | length' {mpath}")]
-    L += ["## 七、附录：warnings / 复核命令表（骨架）", "",
-          f"- warnings 合计 {len(m.get('warnings') or [])} 条，按类别："
-          + (" / ".join(f"{k} {n} 条" for k, n in sorted(wc.items())) or "无"),
-          f"- 使用记录未匹配到现存 skill：{a['unmatched_records']} 条（已删 skill 或内置命令，如实保留）",
-          f"- 注入文件：report-inject.json（{'已填入：' + '、'.join(inject) if inject else '未找到/无内容，占位注释保留'}）",
-          "- 数据文件：00-inventory.json / 01-metrics.json / 02-eval-results.json（每条结论的数字源）",
-          "", "复核命令（每个聚合数字一行，可原样执行重算）："]
-    L += [f"{lab}：`{cmd}`" for lab, cmd in cmds]
-    return L
+        status = "complete" if isinstance(usage, dict) and (usage.get("sessions_scanned") or 0) > 0 else "unavailable"
+        for agent in agents:
+            coverage[agent] = status
+    return coverage
 
 
-def render_list(metrics, a, inject):
+def _budget_for_agent(agent, meta):
+    value = meta.get("listing_budget_tokens") if isinstance(meta, dict) else None
+    basis = meta.get("budget_basis") if isinstance(meta, dict) else None
+    if isinstance(value, int) and value > 0:
+        return value, basis
+    if agent == "claude-code":
+        return CLAUDE_LISTING_BUDGET, "Claude Code 200k context × 1% 的近似 token 上限"
+    return None, None
+
+
+def _usage_record_status(record, logical_counts, instance_ids):
+    status = record.get("match_status")
+    if status in ("matched", "unmatched", "ambiguous"):
+        return status
+    if record.get("matched") is False:
+        return "unmatched"
+    if record.get("skill_instance_id") in instance_ids:
+        return "matched"
+    logical = record.get("skill_id")
+    if logical_counts.get(logical, 0) == 1:
+        return "matched"
+    if logical_counts.get(logical, 0) > 1:
+        return "ambiguous"
+    return "unmatched"
+
+
+def aggregate(skills, usage, metrics=None):
+    """Single deterministic aggregation point; identity is canonical instance_id only."""
+    metrics = metrics or {}
+    # agent 字段可能是任意 JSON 值；聚合键统一文本化，防 unhashable/混型 sorted 崩溃
+    for skill in skills:
+        if not isinstance(skill.get("agent"), str):
+            skill["agent"] = safe_text(skill.get("agent")) or "unknown"
+    by_instance = {skill["instance_id"]: skill for skill in skills}
+    agent_names = sorted(set(skill.get("agent") or "unknown" for skill in skills))
+    metric_agents = ((metrics.get("metrics_meta") or {}).get("by_agent") or {})
+    agent_rows = {}
+    for agent in agent_names:
+        subset = [skill for skill in skills if (skill.get("agent") or "unknown") == agent]
+        statuses = Counter((skill.get("tokens") or {}).get("accounting_status") or "inferred" for skill in subset)
+        confirmed = sum(tok(skill, "always") or 0 for skill in subset
+                        if (skill.get("tokens") or {}).get("accounting_status") == "confirmed")
+        inferred = sum(tok(skill, "always") or 0 for skill in subset
+                       if (skill.get("tokens") or {}).get("accounting_status") == "inferred")
+        excluded = sum(tok(skill, "always") or 0 for skill in subset
+                       if (skill.get("tokens") or {}).get("accounting_status") == "excluded")
+        budget, budget_basis = _budget_for_agent(agent, metric_agents.get(agent) or {})
+        agent_rows[agent] = {
+            "confirmed_components": statuses.get("confirmed", 0),
+            "inferred_components": statuses.get("inferred", 0),
+            "excluded_components": statuses.get("excluded", 0),
+            "confirmed_tokens": confirmed,
+            "inferred_tokens": inferred,
+            "excluded_tokens": excluded,
+            "listing_demand": confirmed,
+            "potential_demand": confirmed + inferred,
+            "budget": budget,
+            "budget_basis": budget_basis,
+            "injected_upper_bound": min(confirmed, budget) if budget is not None else None,
+            "potential_overflow": max(0, confirmed - budget) if budget is not None else None,
+            "potential_overflow_with_inferred": max(0, confirmed + inferred - budget) if budget is not None else None,
+            "component_types": Counter(skill.get("component_type") or "skill" for skill in subset),
+        }
+
+    logical_counts = Counter(skill.get("logical_id") or skill.get("id") for skill in skills)
+    usage_records = [item for item in ((usage or {}).get("records") or []) if isinstance(item, dict)]
+    usage_statuses = Counter()
+    usage_activations = Counter()
+    for record in usage_records:
+        status = _usage_record_status(record, logical_counts, set(by_instance))
+        usage_statuses[status] += 1
+        usage_activations[status] += _count(record.get("activations"))
+    coverage = _usage_coverage(usage, agent_names)
+
+    pairs = {}
+    for skill in skills:
+        source_id = skill["instance_id"]
+        for duplicate in skill.get("duplication") or []:
+            target_id = duplicate.get("with")
+            if target_id not in by_instance or target_id == source_id:
+                continue
+            key = tuple(sorted((source_id, target_id)))
+            old = pairs.get(key)
+            if old is None or (duplicate.get("jaccard") or 0) > (old.get("jaccard") or 0):
+                pairs[key] = dict(duplicate)
+    cross_pairs, same_agent_pairs = [], []
+    for key, duplicate in sorted(pairs.items()):
+        left, right = by_instance[key[0]], by_instance[key[1]]
+        row = {"ids": key, "left": left, "right": right, "jaccard": duplicate.get("jaccard"),
+               "note": duplicate.get("note"), "relation": duplicate.get("relation")}
+        if left.get("agent") != right.get("agent"):
+            cross_pairs.append(row)
+        else:
+            same_agent_pairs.append(row)
+
+    priorities = defaultdict(list)
+    for skill in skills:
+        priority = skill.get("priority")
+        if isinstance(priority, dict) and isinstance(priority.get("score"), (int, float)):
+            priorities[skill.get("agent") or "unknown"].append(skill)
+    for agent in priorities:
+        priorities[agent].sort(key=lambda skill: (-skill["priority"]["score"], skill["instance_id"]))
+
+    flags = Counter(flag for skill in skills for flag in (skill.get("structure_flags") or []))
+    zero_confirmed = defaultdict(list)
+    unknown_usage = defaultdict(list)
+    for skill in skills:
+        agent = skill.get("agent") or "unknown"
+        activation = act(skill)
+        if activation is None:
+            unknown_usage[agent].append(skill)
+        elif activation == 0 and coverage.get(agent) == "complete":
+            zero_confirmed[agent].append(skill)
+    return {
+        "by_instance": by_instance,
+        "agent_rows": agent_rows,
+        "coverage": coverage,
+        "usage_statuses": usage_statuses,
+        "usage_activations": usage_activations,
+        "cross_pairs": cross_pairs,
+        "same_agent_pairs": same_agent_pairs,
+        "priorities": priorities,
+        "flags": flags,
+        "zero_confirmed": zero_confirmed,
+        "unknown_usage": unknown_usage,
+    }
+
+
+def _discovery_summary(metrics, agent_names):
+    # agents[] 的 agent 字段可能是任意 JSON 值（list 不可哈希）——键化前先文本化
+    meta = {}
+    for item in (metrics.get("agents") or []):
+        if isinstance(item, dict):
+            meta[safe_text(item.get("agent")) or "unknown"] = item
+    statuses = {}
+    complete = bool(agent_names)
+    for agent in agent_names:
+        item = meta.get(agent) or {}
+        discovery = item.get("discovery") if isinstance(item.get("discovery"), dict) else {}
+        status = discovery.get("status")
+        if status not in ("complete", "partial", "fallback", "unavailable"):
+            status = "unavailable"
+        statuses[agent] = status
+        if status != "complete":
+            complete = False
+    return statuses, complete
+
+
+def _eval_result_status(result):
+    status = result.get("status")
+    if status in ("complete", "cached", "partial", "unsupported_runtime", "error", "dry_run"):
+        return status
+    if result.get("error"):
+        return "error"
+    if result.get("partial"):
+        return "partial"
+    if result.get("cases") and result.get("delta") is not None:
+        return "cached" if result.get("cache_hit") or result.get("cached") else "complete"
+    return "partial"
+
+
+def _case_scoreable(case):
+    if case.get("status") not in (None, "complete"):
+        return False
+    if case.get("skipped_paid_graders") is True or case.get("errors"):
+        return False
+    return all(isinstance(case.get(key), (int, float)) for key in ("with_score", "without_score", "delta"))
+
+
+def _result_verified(result):
+    status = _eval_result_status(result)
+    cases = [case for case in (result.get("cases") or []) if isinstance(case, dict)]
+    return bool(
+        status in ("complete", "cached")
+        and not result.get("partial")
+        and not result.get("error")
+        and cases
+        and all(_case_scoreable(case) for case in cases)
+        and result.get("model") not in (None, "", "unknown", "mixed")
+    )
+
+
+def _eval_index(eval_document, skills):
+    by_instance = {skill["instance_id"]: skill for skill in skills}
+    by_logical = defaultdict(list)
+    for skill in skills:
+        by_logical[skill.get("logical_id") or skill.get("id")].append(skill)
+    rows = []
+    for result in (eval_document or {}).get("results") or []:
+        if not isinstance(result, dict):
+            continue
+        instance_id = result.get("skill_instance_id")
+        skill = by_instance.get(instance_id)
+        if skill is None:
+            candidates = by_logical.get(result.get("skill_id")) or []
+            if len(candidates) == 1:
+                skill = candidates[0]
+                instance_id = skill["instance_id"]
+        rows.append((instance_id or _text(result.get("skill_id"), "unknown"), skill, result))
+    rows.sort(key=lambda row: (row[1].get("agent") if row[1] else "~", row[0]))
+    return rows
+
+
+def _eval_summary(eval_document, skills):
+    rows = _eval_index(eval_document, skills)
+    statuses = Counter(_eval_result_status(result) for _instance, _skill, result in rows)
+    verified = sum(1 for _instance, _skill, result in rows if _result_verified(result))
+    return rows, statuses, verified, len(rows) - verified
+
+
+def _render_eval(lines, eval_document, skills, legacy_eval):
+    rows, statuses, verified, unverified = _eval_summary(eval_document, skills)
+    lines += ["## 六、深度评测结果（只消费官方聚合与显式状态）", ""]
+    if legacy_eval:
+        lines += ["> 输入为 legacy eval：缺失的新状态按保守口径适配，不能作为当前运行时完整性证明。", ""]
+    lines += [
+        "- 实际模型汇总：%s；请求执行模型：%s；judge：%s；运行时/后端：%s / %s；顶层状态：%s" % (
+            safe_text(eval_document.get("model") or "unknown"),
+            safe_text(eval_document.get("requested_model") or "unknown"),
+            safe_text(eval_document.get("judge_model") or eval_document.get("requested_judge_model") or "unknown"),
+            safe_text(eval_document.get("runtime_agent") or "unknown"),
+            safe_text(eval_document.get("backend") or "unknown"),
+            safe_text(eval_document.get("status") or ("legacy" if legacy_eval else "unknown")),
+        ),
+        "- 总预算（启动上限）：%s；本次实际新增花费：%s；cost scope：%s" % (
+            money(eval_document.get("total_budget_usd")), money(eval_document.get("total_cost_usd")),
+            safe_text(eval_document.get("cost_scope") or ("legacy-unknown" if legacy_eval else "unknown")),
+        ),
+        "- 预算说明：总预算是启动上限；即使 concurrency=1，一个已经启动的在途 run 仍可能让最终花费小幅突破。",
+        "- 结果分桶：已验证 %d；内容价值未验证 %d；%s" % (
+            verified, unverified,
+            " / ".join("%s %d" % (key, statuses[key]) for key in sorted(statuses)) or "无结果",
+        ),
+        "",
+        "| instance | runtime | actual model | requested model | judge | status | partial/cache | cases | 官方 Δ | 判定 | 本次成本 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for instance_id, skill, result in rows:
+        status = _eval_result_status(result)
+        cases = [case for case in (result.get("cases") or []) if isinstance(case, dict)]
+        complete_cases = sum(1 for case in cases if _case_scoreable(case))
+        partial = "partial=%s" % ("yes" if result.get("partial") else "no")
+        cache = "cache=%s" % ("hit" if status == "cached" or result.get("cache_hit") else "miss")
+        delta = result.get("delta")
+        delta_text = "%+.3f" % delta if isinstance(delta, (int, float)) else "—"
+        runtime_name = skill.get("runtime_name") if skill else result.get("skill_id")
+        row = [
+            instance_id, runtime_name,
+            result.get("model") or "unknown", result.get("requested_model") or eval_document.get("requested_model") or "unknown",
+            result.get("judge_model") or eval_document.get("judge_model") or "unknown",
+            status, "%s; %s" % (partial, cache), "%d/%d complete" % (complete_cases, len(cases)),
+            delta_text, VERDICT_LABEL.get(result.get("verdict"), result.get("verdict") or "—"),
+            money(result.get("cost_usd_this_run")),
+        ]
+        lines.append("| " + " | ".join(cell(value) for value in row) + " |")
+    lines.append("")
+    for instance_id, _skill, result in rows:
+        detail = result.get("partial_reason") or result.get("error") or result.get("evidence")
+        if detail:
+            lines.append("- %s：%s" % (safe_text(instance_id), safe_text(detail)))
+    lines.append("")
+
+
+def render(metrics, usage_src, usage, eval_document, inject, summary, legacy_metrics=False, legacy_eval=False):
     skills = metrics["skills"]
-    date = (metrics.get("generated_at") or "")[:10] or "unknown"
-    L = [f"# 我的 Skill 清单 · {date}（{len(skills)} 个）", "",
-         "> 用法：记不起装了什么时，把本文件丢给 Agent 让它自己判断该用哪个",
-         "> 骨架由 render_report.py 渲染（按 agent 分组、名称排序，重跑等价）；分类与场景建议为注入位", ""]
-    L += ([inject["inventory_list"], ""] if inject.get("inventory_list") else
-          ["<!-- INJECT: 清单分类与场景建议（Agent 按使用场景重排分组，并为每个 skill 在行末补“一行干什么 + 什么时候用”）-->", ""])
-    for g in sorted(a["by_agent"]):
-        L += [f"## {g}（{a['by_agent'][g]} 个）", ""]
-        L += [f"- **{s['name']}**（30天 {act(s)} 次）"
-              for s in sorted((x for x in skills if x["agent"] == g), key=lambda x: x["name"])] + [""]
-    return L
+    lines = []
+    report_date = (metrics.get("generated_at") or metrics.get("measured_at") or "")[:10] or "unknown"
+    agent_names = sorted(summary["agent_rows"])
+    discovery_statuses, discovery_complete = _discovery_summary(metrics, agent_names)
+    lines += ["# Skill 审计报告 · %s" % report_date, ""]
+    if legacy_metrics:
+        lines += ["> 重要：legacy inferred，非当前活跃性证明。旧输入缺少运行时 active/accounting 证据，所有组件只按 inferred/unknown 展示。", ""]
+    scope_label = "当前全量" if discovery_complete else "已确认清单 + 推断候选"
+    lines += [
+        "> 口径声明（脚本固定渲染）：",
+        "> - 覆盖结论：%s；只有 discovery=complete 的 Agent 才能称为当前全量" % scope_label,
+        "> - 按 Agent 分账：不同 Agent 的 listing demand 绝不相加成一张“每次会话账单”",
+        "> - token 为 o200k_local 近似；always 只计 description，不含运行时可能附加的 name/格式开销",
+        "> - active+listing confirmed 才进 confirmed 账单；unknown/estimated 与 excluded 分列",
+        "> - 未知 usage 保持未知，不按 0 激活处理；跨 Agent 副本只表示维护关系",
+    ]
+    if eval_document:
+        lines += [
+            "> - 评测总预算（启动上限）：%s；本次实际新增花费：%s；实际模型：%s" % (
+                money(eval_document.get("total_budget_usd")), money(eval_document.get("total_cost_usd")),
+                safe_text(eval_document.get("model") or "unknown"),
+            )
+        ]
+    else:
+        lines += ["> - 深度评测：未运行；本次付费评测花费 $0.00"]
+    lines.append("")
+
+    lines += [
+        "## 一、总览（按 Agent 分账）", "",
+        "| Agent | discovery | confirmed active | confirmed token | inferred/unknown | inferred token | excluded | excluded token | listing demand | injected upper bound | potential overflow |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    budget_notes = []
+    for agent in agent_names:
+        row = summary["agent_rows"][agent]
+        if row["budget"] is None:
+            injected = "无可比 token 上限"
+            overflow = "无可比 token 上限"
+        else:
+            injected = "%s / budget %s" % (fmt(row["injected_upper_bound"]), fmt(row["budget"]))
+            overflow = fmt(row["potential_overflow"])
+        values = [
+            agent, discovery_statuses.get(agent, "unavailable"),
+            row["confirmed_components"], row["confirmed_tokens"],
+            row["inferred_components"], row["inferred_tokens"],
+            row["excluded_components"], row["excluded_tokens"],
+            row["listing_demand"], injected, overflow,
+        ]
+        lines.append("| " + " | ".join(cell(value) for value in values) + " |")
+        if row["budget"] is not None:
+            budget_notes.append("%s 预算依据：%s；含推断的潜在需求=%s、含推断的溢出=%s" % (
+                safe_text(agent), safe_text(row["budget_basis"]), fmt(row["potential_demand"]),
+                fmt(row["potential_overflow_with_inferred"]),
+            ))
+    lines += [
+        "",
+        "说明：listing demand 是 confirmed active 的已确认需求；injected upper bound 是已知预算下最多可注入的 confirmed token；"
+        "potential overflow 是 confirmed demand 超出该上限的部分。没有同单位、同口径上限的 Agent 不做猜测。",
+    ]
+    for note in budget_notes:
+        lines.append("- " + note)
+    lines += ["", ""]
+
+    lines += [
+        "## 二、真账单（canonical instance 全量明细）", "",
+        "| instance | runtime | agent | type | active | listing/trigger | 常驻token | 触发token | refs | usage | priority | 标记 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    status_order = {"confirmed": 0, "inferred": 1, "excluded": 2}
+    ordered_skills = sorted(skills, key=lambda skill: (
+        skill.get("agent") or "unknown",
+        status_order.get((skill.get("tokens") or {}).get("accounting_status"), 9),
+        -(tok(skill, "always") or 0), skill["instance_id"],
+    ))
+    for skill in ordered_skills:
+        accounting = skill.get("accounting") or {}
+        activation = act(skill)
+        usage_text = "未知" if activation is None else "%s 次" % fmt(activation)
+        priority = skill.get("priority")
+        priority_text = "—" if not isinstance(priority, dict) else "%s（Agent内归一）" % priority.get("score", "—")
+        flags = "+".join(FLAG_LABEL.get(flag, flag) for flag in (skill.get("structure_flags") or [])) or "—"
+        values = [
+            skill["instance_id"], skill.get("runtime_name"), skill.get("agent"), skill.get("component_type"),
+            skill.get("active_state") or "unknown",
+            "%s/%s (%s)" % (accounting.get("listing", "estimated"), accounting.get("trigger", "estimated"),
+                             (skill.get("tokens") or {}).get("accounting_status", "inferred")),
+            fmt(tok(skill, "always")), fmt(tok(skill, "on_trigger")), fmt(tok(skill, "refs_total")),
+            usage_text, priority_text, flags,
+        ]
+        lines.append("| " + " | ".join(cell(value) for value in values) + " |")
+    lines.append("")
+
+    lines += ["## 三、诊断事实（不替用户执行处置）", "", "### 使用覆盖"]
+    raw_coverage = ((usage or {}).get("coverage") or {}).get("by_agent") if isinstance((usage or {}).get("coverage"), dict) else {}
+    lines += [
+        "| Agent | status | sessions | unreadable | parse errors | undated | matched activations | limitations |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for agent in agent_names:
+        detail = raw_coverage.get(agent) if isinstance(raw_coverage, dict) else None
+        detail = detail if isinstance(detail, dict) else {}
+        values = [
+            agent, summary["coverage"].get(agent, "unavailable"), detail.get("sessions_scanned"),
+            detail.get("files_unreadable"), detail.get("parse_errors"), detail.get("undated_events"),
+            detail.get("matched_activations"), "；".join(detail.get("limitations") or []) or "—",
+        ]
+        lines.append("| " + " | ".join(cell(value) for value in values) + " |")
+    lines += [
+        "",
+        "- 使用记录：matched %d（%s 次激活） / 未匹配 %d（%s 次） / 歧义 %d（%s 次）；unmatched/ambiguous 不归入任何组件。" % (
+            summary["usage_statuses"].get("matched", 0), fmt(summary["usage_activations"].get("matched", 0)),
+            summary["usage_statuses"].get("unmatched", 0), fmt(summary["usage_activations"].get("unmatched", 0)),
+            summary["usage_statuses"].get("ambiguous", 0), fmt(summary["usage_activations"].get("ambiguous", 0)),
+        ),
+    ]
+    for agent in agent_names:
+        lines.append("- %s：已确认窗口零激活 %d；usage 未知 %d。" % (
+            safe_text(agent), len(summary["zero_confirmed"].get(agent, [])),
+            len(summary["unknown_usage"].get(agent, [])),
+        ))
+
+    lines += ["", "### 重复候选"]
+    lines += [
+        "- 跨 Agent 维护副本 %d 对：这是安装/发布维护关系，不代表单次会话可节省，也不合并两个 Agent 的 listing 账单。" %
+        len(summary["cross_pairs"]),
+        "- 同 Agent 重复候选 %d 对：仅作为人工合并候选，不自动决定 precedence、删除或 winner。" %
+        len(summary["same_agent_pairs"]),
+    ]
+    for pair in summary["cross_pairs"][:20]:
+        lines.append("- 跨 Agent：%s/%s ↔ %s/%s（Jaccard %s，跨 Agent 维护副本）" % (
+            safe_text(pair["left"].get("agent")), safe_text(pair["ids"][0]),
+            safe_text(pair["right"].get("agent")), safe_text(pair["ids"][1]),
+            fmt(pair.get("jaccard")),
+        ))
+    for pair in summary["same_agent_pairs"][:20]:
+        lines.append("- 同 Agent：%s ↔ %s（Jaccard %s，须人工确认）" % (
+            safe_text(pair["ids"][0]), safe_text(pair["ids"][1]), fmt(pair.get("jaccard"))))
+
+    lines += ["", "### 结构问题"]
+    lines.append("- " + (" / ".join("%s %d" % (FLAG_LABEL.get(flag, flag), summary["flags"][flag])
+                                         for flag in sorted(summary["flags"])) or "无机器结构信号"))
+    healthy = sum(1 for skill in skills
+                  if not (skill.get("structure_flags") or [])
+                  and not (skill.get("duplication") or [])
+                  and act(skill) not in (None, 0)
+                  and (skill.get("tokens") or {}).get("measurement_status") == "complete")
+    lines.append("- 健康候选 %d（有直接使用、内容量测完整、无结构/重复信号；仍不等于语义价值已验证）。" % healthy)
+    lines.append("")
+    if inject.get("diagnosis"):
+        lines += [inject["diagnosis"], ""]
+    else:
+        lines += ["<!-- INJECT: Agent 按 references/audit-rubric.md 补充诊断；所有疑似结论保留人工复核。 -->", ""]
+
+    lines += [
+        "## 四、高嫌疑名单（每个 Agent 独立归一，跨 Agent 分数不可直接比较）", "",
+    ]
+    for agent in agent_names:
+        candidates = summary["priorities"].get(agent) or []
+        lines += ["### %s（%d 个可排序组件）" % (safe_text(agent), len(candidates)), "",
+                  "| # | instance | runtime | score | Agent 内归一理由 |", "|---|---|---|---|---|"]
+        for index, skill in enumerate(candidates[:15], 1):
+            priority = skill["priority"]
+            values = [index, skill["instance_id"], skill.get("runtime_name"), priority.get("score"),
+                      "；".join(priority.get("reasons") or [])]
+            lines.append("| " + " | ".join(cell(value) for value in values) + " |")
+        lines.append("")
+    if inject.get("suspect_actions"):
+        lines += [inject["suspect_actions"], ""]
+    else:
+        lines += ["<!-- INJECT: 高嫌疑建议动作；不要跨 Agent 比 priority 分数。 -->", ""]
+
+    lines += ["## 五、处置建议（注入位）", ""]
+    if inject.get("recommendations"):
+        lines += [inject["recommendations"], ""]
+    else:
+        lines += ["<!-- INJECT: 按 references/refactor-playbook.md 写信号、预计收益、风险前提和人工确认框。 -->", ""]
+
+    if eval_document:
+        _render_eval(lines, eval_document, skills, legacy_eval)
+
+    issue_rows = [item for item in (metrics.get("issues") or []) if isinstance(item, dict)]
+    issue_counts = Counter(item.get("code") or "unknown" for item in issue_rows)
+    metrics_path = _text(metrics.get("_path"))
+    quoted_metrics = shlex.quote(metrics_path).replace("\n", "?").replace("`", "?")
+    quoted_usage = shlex.quote(_text(usage_src)).replace("\n", "?").replace("`", "?")
+    commands = [
+        ("按 Agent 的 confirmed/inferred/excluded 数量与 token", "jq '.metrics_meta.by_agent' %s" % quoted_metrics),
+        ("canonical instance 唯一性", "jq '[.skills[].instance_id] | length == (unique|length)' %s" % quoted_metrics),
+        ("usage match_status 分桶", "jq '.usage.records | group_by(.match_status) | map({status:(.[0].match_status // \"legacy\"),n:length})' %s" % quoted_usage),
+        ("跨 Agent 维护副本候选", "jq '[.skills[] as $s | $s.duplication[]? | select(.relation==\"cross_agent_maintenance_copy\") | {from:$s.instance_id,to:.with}]' %s" % quoted_metrics),
+    ]
+    lines += ["## 七、附录：issues 与复核入口", ""]
+    lines.append("- structured issues %d：%s" % (
+        len(issue_rows), " / ".join("%s %d" % (key, issue_counts[key]) for key in sorted(issue_counts)) or "无"))
+    lines.append("- legacy warnings 投影 %d 条；机器判断只读 issues。" % len(metrics.get("warnings") or []))
+    lines.append("- 注入文件：%s。" % ("已加载 " + "、".join(sorted(inject)) if inject else "未加载，占位注释保留"))
+    lines += ["", "复核命令（所有账单仍按 Agent 分组）："]
+    for label, command in commands:
+        lines.append("- %s：%s" % (safe_text(label), inline_code(command)))
+    return lines
+
+
+def render_list(metrics, summary, inject):
+    skills = metrics["skills"]
+    report_date = (metrics.get("generated_at") or metrics.get("measured_at") or "")[:10] or "unknown"
+    lines = [
+        "# 我的 Skill 清单 · %s（%d 个实例）" % (report_date, len(skills)), "",
+        "> 按 Agent 分组；active confirmed、inferred/unknown、excluded 不混写。", "",
+    ]
+    if inject.get("inventory_list"):
+        lines += [inject["inventory_list"], ""]
+    else:
+        lines += ["<!-- INJECT: 仅补场景建议，不改脚本生成的实例与状态。 -->", ""]
+    for agent in sorted(summary["agent_rows"]):
+        subset = sorted((skill for skill in skills if skill.get("agent") == agent),
+                        key=lambda skill: (skill.get("runtime_name") or "", skill["instance_id"]))
+        lines += ["## %s（%d 个实例）" % (safe_text(agent), len(subset)), ""]
+        for skill in subset:
+            accounting_status = (skill.get("tokens") or {}).get("accounting_status") or "inferred"
+            activation = act(skill)
+            usage = "usage未知" if activation is None else "窗口%s次" % fmt(activation)
+            lines.append("- %s — %s / %s / %s / %s" % (
+                safe_text(skill.get("runtime_name")), safe_text(skill["instance_id"]),
+                safe_text(skill.get("component_type")), accounting_status, usage,
+            ))
+        lines.append("")
+    return lines
+
+
+def _write_lines(path, lines):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines).rstrip("\n") + "\n")
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="渲染 03-report.md 骨架（两段式产出：骨架脚本 + Agent 注入）")
-    ap.add_argument("--metrics", required=True, help="01-metrics.json（必需）")
-    ap.add_argument("--inventory", help="00-inventory.json（可选，usage/终身计数口径分侧用）")
-    ap.add_argument("--eval", dest="eval_path", help="02-eval-results.json（可选，有则渲染第六节）")
-    ap.add_argument("--out", required=True, help="输出 03-report.md 路径")
-    ap.add_argument("--inventory-list", help="可选，一并渲染 Skill清单.md 骨架")
-    ap.add_argument("--inject", help="report-inject.json 路径（缺省探测 --out 同目录）")
-    ap.add_argument("--json", action="store_true", help="stdout 打印机器可读聚合")
-    args = ap.parse_args(argv)
-    metrics = load(args.metrics)
-    metrics["_path"] = args.metrics  # 仅供附录复核命令引用原路径
-    if not (metrics.get("skills") or []):
-        print("error: 输入异常——扫描到 0 个 skill，不出报告（report-format.md 失配警示）", file=sys.stderr)
+    parser = argparse.ArgumentParser(description="按 Agent/instance_id 确定性渲染 03-report.md；输入只读。")
+    parser.add_argument("--metrics", required=True, help="01-metrics.json（必需）")
+    parser.add_argument("--inventory", help="00-inventory.json（可选，usage 事实源）")
+    parser.add_argument("--eval", dest="eval_path", help="02-eval-results.json（可选）")
+    parser.add_argument("--out", required=True, help="输出 03-report.md 路径")
+    parser.add_argument("--inventory-list", help="可选，一并渲染 Skill清单.md")
+    parser.add_argument("--inject", help="report-inject.json；默认探测 --out 同目录")
+    parser.add_argument("--json", action="store_true", help="stdout 打印机器可读聚合")
+    args = parser.parse_args(argv)
+
+    try:
+        raw_metrics = load(args.metrics)
+    except (OSError, ValueError) as exc:
+        print("render_report.py: 读取 metrics 失败（%s）" % exc, file=sys.stderr)
         return 2
-    skills = metrics["skills"]
-    inv = load(args.inventory) if args.inventory and os.path.isfile(args.inventory) else None
-    usage_src = args.inventory if inv is not None else args.metrics
-    usage = (inv or metrics).get("usage")
-    ev = load(args.eval_path) if args.eval_path and os.path.isfile(args.eval_path) else None
+    ok, message = _schema_supported(raw_metrics, METRICS_SCHEMA_NAME)
+    if not ok:
+        print("render_report.py: %s" % message, file=sys.stderr)
+        return 2
+    metrics, legacy_metrics = adapt_metrics(raw_metrics)
+    metrics["_path"] = args.metrics
+    if not metrics.get("skills"):
+        print("error: 输入异常——扫描到 0 个 component，不出报告", file=sys.stderr)
+        return 2
+
+    inventory = None
+    if args.inventory and os.path.isfile(args.inventory):
+        try:
+            inventory = load(args.inventory)
+        except (OSError, ValueError) as exc:
+            print("render_report.py: 读取 inventory 失败（%s）" % exc, file=sys.stderr)
+            return 2
+        ok, message = _schema_supported(inventory, INVENTORY_SCHEMA_NAME)
+        if not ok:
+            print("render_report.py: %s" % message, file=sys.stderr)
+            return 2
+    usage_source = args.inventory if inventory is not None else args.metrics
+    usage = (inventory or metrics).get("usage")
+
+    eval_document, legacy_eval = None, False
+    if args.eval_path and os.path.isfile(args.eval_path):
+        try:
+            eval_document = load(args.eval_path)
+        except (OSError, ValueError) as exc:
+            print("render_report.py: 读取 eval 失败（%s）" % exc, file=sys.stderr)
+            return 2
+        ok, message = _schema_supported(eval_document, EVAL_SCHEMA_NAME)
+        if not ok:
+            print("render_report.py: %s" % message, file=sys.stderr)
+            return 2
+        legacy_eval = _major(eval_document) == 1
+
     inject_path = args.inject or os.path.join(os.path.dirname(os.path.abspath(args.out)), "report-inject.json")
     inject = {}
     if os.path.isfile(inject_path):
         try:
-            inject = (load(inject_path) or {}).get("sections") or {}
-        except (ValueError, OSError) as e:
-            print(f"warning: report-inject.json 解析失败（{e}），占位注释保留", file=sys.stderr)
-    a = aggregate(skills, usage)
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.write("\n".join(render(metrics, usage_src, usage, ev, inject, a)).rstrip("\n") + "\n")
-    if args.inventory_list:
-        with open(args.inventory_list, "w", encoding="utf-8") as f:
-            f.write("\n".join(render_list(metrics, a, inject)).rstrip("\n") + "\n")
+            loaded = load(inject_path)
+            inject = loaded.get("sections") if isinstance(loaded, dict) else {}
+            inject = {key: value for key, value in (inject or {}).items() if isinstance(key, str) and isinstance(value, str)}
+        except (OSError, ValueError) as exc:
+            print("warning: report-inject.json 解析失败（%s），占位注释保留" % exc, file=sys.stderr)
+
+    summary = aggregate(metrics["skills"], usage, metrics)
+    report_lines = render(metrics, usage_source, usage, eval_document, inject, summary,
+                          legacy_metrics=legacy_metrics, legacy_eval=legacy_eval)
+    try:
+        _write_lines(args.out, report_lines)
+        if args.inventory_list:
+            _write_lines(args.inventory_list, render_list(metrics, summary, inject))
+    except OSError as exc:
+        print("render_report.py: 输出失败（%s）" % exc, file=sys.stderr)
+        return 2
+
     if args.json:
-        print(json.dumps({"out": args.out, "skills": len(skills), "always_total": a["always_total"],
-                          "by_agent": dict(a["by_agent"]), "flags": dict(a["flags"]),
-                          "zero_act": len(a["zero_act"]), "cc_infer0": len(a["cc_infer0"]),
-                          "cx_nolifetime": len(a["cx_nolifetime"]), "cross_name_pairs": len(a["cross_name"]),
-                          "cx_dup_always": a["cx_dup_always"], "dup_both_always": a["dup_both_always"],
-                          "rename_pairs": len(a["rename"])}, ensure_ascii=False))
-    print(f"渲染完成：{args.out}" + (f"；{args.inventory_list}" if args.inventory_list else ""))
+        payload = {
+            "out": args.out,
+            "components": len(metrics["skills"]),
+            "by_agent": summary["agent_rows"],
+            "usage_match_status": dict(sorted(summary["usage_statuses"].items())),
+            "cross_agent_maintenance_pairs": len(summary["cross_pairs"]),
+            "same_agent_duplicate_pairs": len(summary["same_agent_pairs"]),
+            "legacy_metrics": legacy_metrics,
+            "eval": None,
+        }
+        if eval_document:
+            _rows, statuses, verified, unverified = _eval_summary(eval_document, metrics["skills"])
+            payload["eval"] = {
+                "status": eval_document.get("status"),
+                "model": eval_document.get("model"),
+                "total_budget_usd": eval_document.get("total_budget_usd"),
+                "total_cost_usd": eval_document.get("total_cost_usd"),
+                "verified": verified,
+                "unverified": unverified,
+                "result_statuses": dict(sorted(statuses.items())),
+            }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    print("渲染完成：%s%s" % (args.out, "；%s" % args.inventory_list if args.inventory_list else ""))
     return 0
 
 

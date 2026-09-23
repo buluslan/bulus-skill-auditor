@@ -4,25 +4,25 @@
     {
       "id": 1,
       "prompt": "帮我审计一下我的 skills，先不花钱的那种",
-      "expected_output": "触发 skill-auditor；跑 collect+measure+render_report 三脚本；产出报告（含口径声明/真账单表/诊断明细/高嫌疑名单/处置建议）；不跑 eval 深度层；不删改任何文件；报告数字附复核命令",
+      "expected_output": "触发本 skill；跑 collect+measure+render_report 三脚本；产出报告骨架（口径声明/按 Agent 分列的账单表/诊断明细/高嫌疑名单）+ Agent 注入诊断；不跑深度评测；不删改任何被审计对象；聚合数字全部来自脚本并附复核命令；发现层区分已确认/推断/排除",
       "files": []
     },
     {
       "id": 2,
       "prompt": "生成一份我的 skill 清单，我要看看我到底装了哪些",
-      "expected_output": "清单模式：产出 Skill清单.md；报告骨架照常渲染但诊断/建议注入位留空不写，分钟内完成",
+      "expected_output": "清单模式：产出 Skill清单.md（已确认/推断/排除分开）；报告骨架照常渲染但诊断/建议注入位留空不写；通常几分钟内完成",
       "files": []
     },
     {
       "id": 3,
       "prompt": "全面审计，包括对高嫌疑的跑深度验证，预算不超过 3 美元",
-      "expected_output": "静态层+预筛+受控 eval：先报价列出候选再跑（或按用户已给预算直接跑但给出成本上限保护）；02-eval-results.json 含 with/without/Δ/verdict；报告含成本段与'疑似原生覆盖'的疑似标注（不下死结论）",
+      "expected_output": "免费层+预筛+受控评测：先按案例数×运行次数×模型报价并列出候选，用户确认后才启动；evaluate 必须带 --runtime-agent 与真实 --model；02-eval-results.json 含状态/实际模型/两臂分数/费用；部分结果或模型不一致只出'无结论'；报告费用只读 total_budget_usd/total_cost_usd",
       "files": []
     },
     {
       "id": 4,
       "prompt": "新模型发布了，重新扫一遍上次审计过的高嫌疑 skill",
-      "expected_output": "识别重扫场景：读取上次审计缓存（若有则只重跑受影响层，说明哪些沿用哪些重跑）；无缓存时诚实说明并按首次审计走",
+      "expected_output": "识别重扫场景：静态内容未变时复用可验证结论；评测缓存按内容+案例+模型等完整 fingerprint 比对，换模型自动失效重考（--skip-cached 须配 --model）；无历史结果时诚实说明并按首次审计走",
       "files": []
     }
   ]

@@ -1,0 +1,10 @@
+# Release metadata (single source). Verified by skill-publish preflight before commit.
+name: bulus-skill-auditor
+display_name: skill 体检大师（bulus-skill-auditor）
+version: 0.2.0
+developer: buluslan
+brand: 新西楼.AI
+visibility: private
+github_owner: buluslan
+publish_tencent: false
+publish_xhs: false

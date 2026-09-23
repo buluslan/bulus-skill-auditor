@@ -1,53 +1,169 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent 适配器注册表。新 agent = 新适配器文件 + 在 REGISTRY 加一行，边际成本一个文件。
+"""Adapter registry and shared, policy-free safety helpers.
 
-统一接口（每个适配器模块必须实现）：
-  detect() -> bool                 本机是否装了这家 agent（根目录存在）
-  skill_roots() -> [path]          skill 根目录列表（只列真实存在的）
-  iter_skills() -> [dict]          契约 skills[] 条目；扫描告警写入模块级 SCAN_WARNINGS
-  usage_records(window_days) -> [dict]
-                                   契约 usage.records 条目（每 skill 一条聚合记录）；
-                                   sessions_scanned/coverage 等元信息写入模块级 USAGE_META
-
-适配器对被扫描对象 100% 只读。
+Agent-specific activation rules live in their adapter modules.  In particular, this
+module never walks plugin caches or infers that a directory is active.
 """
+import json
 import os
+import subprocess
 from pathlib import Path
 
+_CLI_CACHE = {}
+_SEVERITIES = ("info", "warning", "error")
+_STAGES = ("discovery", "parse", "usage", "eval", "report")
+_SAFE_CONTEXT_KEYS = {
+    "component_type", "count", "error_type", "field", "plugin_id", "reason",
+    "returncode", "root_id", "timeout_seconds", "version",
+}
 
-def plugin_skill_dirs(cache_dir, max_depth=5):
-    """在 plugins/cache 目录下找名为 skills* 的目录（claude-code 与 codex 同构，共享此发现逻辑）。
 
-    实测形态（2026-09-17 本机）：cache/<org>/<plugin>/<ver>/skills 与 cache/<org>/<plugin>/<hash>/skills，
-    深度不一，故做限深 DFS 而非固定 glob。
+def normalize_lexical_path(path):
+    """Return a stable absolute lexical path without resolving symlinks."""
+    return os.path.abspath(os.path.normpath(str(path)))
+
+
+def path_is_within(path, root):
+    """Lexically contain ``path`` in ``root`` (Python 3.9 compatible)."""
+    try:
+        return os.path.commonpath([normalize_lexical_path(path), normalize_lexical_path(root)]) == normalize_lexical_path(root)
+    except (TypeError, ValueError):
+        return False
+
+
+def make_issue(code, severity, agent, stage, message, path=None, safe_context=None):
+    """Build a deterministic diagnostic without copying untrusted CLI/config text."""
+    if severity not in _SEVERITIES:
+        raise ValueError("invalid issue severity: %s" % severity)
+    if stage not in _STAGES:
+        raise ValueError("invalid issue stage: %s" % stage)
+    context = {}
+    for key, value in sorted((safe_context or {}).items()):
+        if key not in _SAFE_CONTEXT_KEYS:
+            continue
+        if value is None or isinstance(value, (bool, int, float)):
+            context[key] = value
+        elif isinstance(value, str):
+            context[key] = value[:200]
+    return {
+        "code": str(code),
+        "severity": severity,
+        "agent": agent,
+        "stage": stage,
+        "message": str(message),
+        "path": normalize_lexical_path(path) if path else None,
+        "safe_context": context,
+    }
+
+
+def issue_sort_key(issue):
+    severity_rank = {"error": 0, "warning": 1, "info": 2}
+    return (
+        severity_rank.get(issue.get("severity"), 9),
+        str(issue.get("agent") or ""),
+        str(issue.get("stage") or ""),
+        str(issue.get("code") or ""),
+        str(issue.get("path") or ""),
+        str(issue.get("message") or ""),
+        json.dumps(issue.get("safe_context") or {}, ensure_ascii=False, sort_keys=True),
+    )
+
+
+def run_cli_json(command, agent, stage, timeout=5):
+    """Run a read-only management CLI once and decode one JSON value safely.
+
+    The process cache prevents repeated calls while discovering multiple components.
+    Diagnostics intentionally contain no stdout/stderr or environment/config values.
     """
-    out = []
-    base = Path(cache_dir)
-    if not base.is_dir():
-        return out
-
-    def walk(d, depth):
-        if depth > max_depth:
-            return
-        try:
-            with os.scandir(str(d)) as it:
-                children = sorted(it, key=lambda e: e.name)
-        except OSError:
-            return
-        for ent in children:
-            if not ent.is_dir():
-                continue
-            if ent.name.startswith("skills"):
-                out.append(Path(ent.path))
+    key = (tuple(command), int(timeout))
+    if key in _CLI_CACHE:
+        cached = _CLI_CACHE[key]
+        return {
+            "ok": cached["ok"],
+            "data": cached["data"],
+            "returncode": cached["returncode"],
+            "issue": dict(cached["issue"]) if cached.get("issue") else None,
+        }
+    try:
+        proc = subprocess.run(
+            list(command), capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        result = {
+            "ok": False,
+            "data": None,
+            "returncode": None,
+            "issue": make_issue(
+                "management_cli_timeout", "warning", agent, stage,
+                "management CLI timed out; discovery used a conservative fallback",
+                safe_context={"timeout_seconds": timeout},
+            ),
+        }
+    except (OSError, ValueError) as exc:
+        result = {
+            "ok": False,
+            "data": None,
+            "returncode": None,
+            "issue": make_issue(
+                "management_cli_unavailable", "warning", agent, stage,
+                "management CLI could not be started; discovery used a conservative fallback",
+                safe_context={"error_type": type(exc).__name__},
+            ),
+        }
+    else:
+        if proc.returncode != 0:
+            result = {
+                "ok": False,
+                "data": None,
+                "returncode": proc.returncode,
+                "issue": make_issue(
+                    "management_cli_nonzero", "warning", agent, stage,
+                    "management CLI exited non-zero; discovery used a conservative fallback",
+                    safe_context={"returncode": proc.returncode},
+                ),
+            }
+        else:
+            try:
+                data = json.loads(proc.stdout)
+            except (TypeError, ValueError):
+                result = {
+                    "ok": False,
+                    "data": None,
+                    "returncode": proc.returncode,
+                    "issue": make_issue(
+                        "management_cli_bad_json", "warning", agent, stage,
+                        "management CLI returned invalid JSON; discovery used a conservative fallback",
+                    ),
+                }
             else:
-                walk(ent.path, depth + 1)
+                if not isinstance(data, (dict, list)):
+                    result = {
+                        "ok": False,
+                        "data": None,
+                        "returncode": proc.returncode,
+                        "issue": make_issue(
+                            "management_cli_bad_json", "warning", agent, stage,
+                            "management CLI returned an unsupported JSON shape; discovery used a conservative fallback",
+                        ),
+                    }
+                else:
+                    result = {"ok": True, "data": data, "returncode": proc.returncode, "issue": None}
+    _CLI_CACHE[key] = result
+    return {
+        "ok": result["ok"],
+        "data": result["data"],
+        "returncode": result["returncode"],
+        "issue": dict(result["issue"]) if result.get("issue") else None,
+    }
 
-    walk(base, 1)
-    return out
+
+def reset_cli_cache():
+    """Clear process-local management CLI cache (primarily for deterministic tests)."""
+    _CLI_CACHE.clear()
 
 
-# 适配器导入放在 plugin_skill_dirs 定义之后（适配器会 from . import 它，避免部分初始化循环导入）
+# Imports follow helper definitions to avoid partial-initialization cycles.
 from . import claude_code, codex, hermes  # noqa: F401,E402
 
 REGISTRY = {
@@ -59,5 +175,4 @@ ALL_AGENTS = ["claude-code", "codex", "hermes"]
 
 
 def get_adapters(names):
-    """按名字取适配器列表 [(name, module)]；未知名直接 KeyError（调用方先校验）。"""
-    return [(n, REGISTRY[n]) for n in names]
+    return [(name, REGISTRY[name]) for name in names]

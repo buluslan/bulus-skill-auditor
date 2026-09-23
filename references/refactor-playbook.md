@@ -22,19 +22,21 @@
 - **收益**：on_trigger 成本降幅 = 拆出量
 
 ### R4 · description 瘦身（针对 oversized / listing 超预算）
-- **触发**：description > 1024 字符；或 listing 总量超预算（claude-code：全部 always 之和 > 2000 token（= 200k 上下文 × 1% ≈ 官方 8000 字符预算）时提示，超预算会被静默截断——排在后面的 skill 直接从模型视野消失）
+- **触发**：description > 1024 字符；或 listing 超预算——**按 Agent 分账**：claude-code 的 confirmed listing demand（active+listing confirmed 组件的 always 之和）> 2000 token（= 200k 上下文 × 1% ≈ 官方 8000 字符预算）。超预算会被静默截断——排在后面的 skill 直接从模型视野消失。inferred/unknown 组件的 token 单列（potential demand），不混进 confirmed 判定；其他 Agent 无同单位预算，写"无可比 token 上限"，不猜
 - **建议**：description 只留"干什么 + 何时触发"，营销文案移 README；中文触发词保留（触发靠它）
-- **注意**：常驻成本 = 所有 skill 的 description 之和，砍一个最肥的比砍十个瘦的管用（找 metrics 里 always 最大的）
+- **注意**：常驻成本 = 该 Agent 内 confirmed 组件的 description 之和（**绝不跨 Agent 求和**），砍一个最肥的比砍十个瘦的管用（找 metrics 里该 Agent always 最大的）
 
 ### R5 · 合并重复（针对 duplication 高对）
-- **触发**：Jaccard ≥ 0.55 的对（含跨 agent 换名重复——二道贩子换皮 skill 的典型特征）
-- **建议**：功能重叠的给合并方案（以知识密度高的为主体，吸收另一个的独有段，被并方退役）；同 skill 多副本（symlink 之外的物理重复）给去重保留一份
-- **句式**：`A 与 B 重叠度 62%（Jaccard），A 的 X 段独有、B 的 Y 段独有。建议以 A 为主体并入 Y，B 退役。预计每次会话省 <n> token`
+- **触发**：Jaccard ≥ 0.55 的对。**先分两类，措辞不同**：
+  - **跨 Agent 对（cross_agent_maintenance_copy）**：同一内容装在两个 Agent——这是安装/发布维护副本，**不写成"每次会话省 <n> token"**（两个 Agent 各自的 listing 账单独立，合并只减维护成本）。建议措辞：`A（claude-code）与 B（codex）内容重叠 <x>%：维护两份会双倍 upkeep，建议单一源 + 发布管道同步，消除"改一处漏一处"风险`
+  - **同 Agent 对（same_agent_possible_duplicate / name_conflict）**：同一 Agent 内的物理重复/换名重复才是单会话可省的；功能重叠给合并方案（以知识密度高的为主体，吸收另一个的独有段，被并方退役）；同 skill 多副本（symlink 之外的物理重复）给去重保留一份
+- **通用红线**：重复对只是候选，不自动合并、不删除、不决定 precedence；引用组件用 canonical instance_id（同 Agent 同 runtime_name 的多实例都保留）
+- **句式（同 Agent 物理重复）**：`A 与 B 重叠度 62%（Jaccard），A 的 X 段独有、B 的 Y 段独有。建议以 A 为主体并入 Y，B 退役。预计每次会话省 <n> token`
 
 ### R6 · 无效曝光处置（针对 activations=0 且优先级低）
-- **触发**：30 天窗口内 0 激活 + 常驻成本可观
-- **建议**：分两种——①使用统计覆盖正常但从未触发 → 疑似触发词失配（description 与实际说法对不上），先修触发词再观察一轮，别急着删；②确认不需要 → 建议禁用/移出 skill 根（保留目录备份，给出移出命令让用户自己执行）
-- **红线**：使用数据缺失时（coverage 异常）不下"无用"结论，标注"数据不足，建议观察"
+- **触发**：30 天窗口内 0 激活 + 常驻成本可观，**且该 Agent 的 usage coverage=complete**（usage_stats 为 null = 使用情况未知，不适用本条）
+- **建议**：分两种——①coverage=complete 但从未触发 → 疑似触发词失配（description 与实际说法对不上），先修触发词再观察一轮，别急着删；②确认不需要 → 建议禁用/移出 skill 根（保留目录备份，给出移出命令让用户自己执行）
+- **红线**：coverage 非 complete（partial/unavailable）或 usage_stats=null 时不下"无用/零激活"结论，标注"数据不足，建议观察"——未知不按零使用
 
 ## 统一输出格式（报告里每条建议）
 
@@ -48,6 +50,6 @@
 
 ## 来源与依据
 
-- PT2.0 演化教案（V1 惨败 → V2 → Light 6 规则反而省 40.7%）：知识分层与逻辑下沉的反直觉验证（内部调研底稿，不随包发布）
-- "skill 会不断长回来"（dev.to 三次审计复盘）：一次性清理无效，建议给出的是可持续结构（拆 refs/降常驻），不是一次性删减
+- 知识分层与逻辑下沉的反直觉效应：把确定性逻辑移出正文、只保留少量核心规则的"轻量版"，实测比大而全版本效果更好且更省——R1/R2 的方法论基础
+- "skill 会不断长回来"（dev.to 公开复盘）：一次性清理无效，建议给出的是可持续结构（拆 refs/降常驻），不是一次性删减
 - 静默截断机制（官方 issue #13099）：R4 的紧迫性来源——超预算不是"变慢"是"消失"

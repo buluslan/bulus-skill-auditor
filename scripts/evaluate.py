@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""evaluate.py — skill-auditor 深度层：给高嫌疑 skill 办官方对比考试（with/without 两份答卷 eval）
-流程（SKILL.md「深度层」第 3 步；输出以 ../CONTRACT.md 的 02-eval-results.json 为准）：
-读 <out-dir>/cases/<skill-id>/<case-name>/ case 库（prompt.md+graders/；没有 case 的 skill
-报错不跑，先按 references/case-authoring.md 生成过人审）→ 组装临时 pkg 到 <out-dir>/
-.eval-tmp/<id>-pkg/（plugin.json {"name":"<skill-name>-test"} + skills/<name>/ 完整副本 +
-evals/<case>/；skill 源 100% 只读）→ 逐 skill 调官方 CLI（spike S3 实测，cwd=pkg、
-target="."，两份答卷为 CLI 默认行为）：claude plugin eval . --runs N --max-cost-usd B
---no-publish --trust-plugin --json <raw>；超时=60+runs*300s，失败（exit 2 成本顶等）记 errors
-其余继续 → 解析 raw（costUsd / cases[].arms.with|without[]（run 数组）/ aggregates）→ 机械判定
-（Δ>0.1 valuable；|Δ|≤0.1 suspected_native_coverage 疑似须 Agent 复核；两份答卷均<0.5 或
-Δ<-0.1 inconclusive，判定表见 case-authoring.md）→ 写 02-eval-results.json，raw 存 eval-raw/ 作
-证据；prescreen 标 agent-upstream（预筛是 Agent 的活）；其余语义见 --help。"""
+"""Runtime-aware, model-correct orchestration for official Claude plugin evals.
+
+The source component and its cases are read-only.  Temporary packages, raw evidence,
+cache entries, and the current-run report are written only below ``--out-dir``.
+No paid process is started for unsupported runtimes, ambiguous component selectors,
+or an unpinned execution model.
+"""
 import argparse
+import fnmatch
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -21,304 +19,1421 @@ import subprocess
 import sys
 from datetime import datetime
 
-CLI_BIN = 'claude'
+
+CLI_BIN = "claude"
 DEFAULT_RUNS = 2
 DEFAULT_BUDGET = 2.0
-COST_NOTE = 'CLI 报告的 list-price 估算；spike S3 实测单考题两份答卷 2runs ≈ $0.62'
-COPY_IGNORE = shutil.ignore_patterns('.DS_Store', '__pycache__', '*.pyc', '.git')
-# M7：以下两个判定阈值与 CONTRACT.md「判定阈值」节逐字对应，改这里必须同步改 CONTRACT
-DELTA_FLAT = 0.1      # |Δ|≤此值 → suspected_native_coverage（疑似，须 Agent 复核）
-LOW_SCORE = 0.5       # 两份答卷均低于此 → inconclusive（case 可能出坏，回炉）
-PRESCREEN = {'verdict': 'agent-upstream',
-             'reason': '预筛三出口由 Agent 按 references/audit-rubric.md 完成，脚本只做机械 eval'}
-
-
-def sanitize(text):
-    """文件系统/插件名安全片段（skill-id 的 :: 等替换为 _）。"""
-    return ''.join(c if (c.isalnum() or c in '-_.') else '_' for c in text) or 'skill'
+DEFAULT_ABLATION = "with-without"
+SCHEMA_VERSION = "2.0"
+SCHEMA_NAME = "bulus-skill-auditor.eval"
+SUPPORTED_EVAL_SCHEMA_VERSIONS = ("1", "1.0")
+DEFAULT_JUDGE_SENTINEL = "cli-default-unpinned"
+COST_NOTE = (
+    "total_budget_usd 是本次串行启动上限，不是绝对硬封顶；concurrency=1 时，"
+    "一个已经在途的 run 仍可能让最终花费小幅超过上限。total_cost_usd 只统计"
+    "本次新启动且 CLI 可验证的 costUsd，精确缓存命中为 $0。"
+)
+COPY_IGNORE = shutil.ignore_patterns(".DS_Store", "__pycache__", "*.pyc", ".git")
+IGNORE_DIR_NAMES = {".git", "__pycache__"}
+IGNORE_FILE_PATTERNS = (".DS_Store", "*.pyc")
+DELTA_FLAT = 0.1
+LOW_SCORE = 0.5
+PRESCREEN = {
+    "verdict": "agent-upstream",
+    "reason": "预筛由 Agent 按 references/audit-rubric.md 完成；脚本只验证官方 eval 证据",
+}
 
 
 def now_iso():
-    return datetime.now().astimezone().isoformat(timespec='seconds')
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def sanitize(text):
+    """Return a portable filename fragment without evaluating input as a command."""
+    value = str(text or "")
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in value)
+    return safe or "value"
+
+
+def safe_component(text):
+    """Create a collision-resistant path component while preserving already-safe names."""
+    value = str(text or "")
+    safe = sanitize(value)
+    if safe == value and len(safe) <= 96:
+        return safe
+    prefix = safe[:80].rstrip("._-") or "value"
+    return "%s--%s" % (prefix, hashlib.sha256(value.encode("utf-8")).hexdigest()[:12])
+
+
+def is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def clean_text(value):
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def normalize_schema_version(value):
+    if isinstance(value, bool) or value is None:
+        return "unknown"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    return text or "unknown"
+
+
+def concrete_model(value):
+    model = clean_text(value)
+    return bool(model and model.lower() not in {"unknown", "mixed", "auto", "default"})
+
+
+def route_runtime_agent(requested, environ=None):
+    """Resolve a backend without using PATH presence as runtime evidence."""
+    env = os.environ if environ is None else environ
+    if requested == "claude-code":
+        return "claude-code", "claude-plugin-eval"
+    if requested == "other":
+        return "other", "none"
+    if env.get("CLAUDECODE") == "1":
+        return "claude-code", "claude-plugin-eval"
+    return "unknown", "none"
+
+
+def _legacy_instance_id(skill):
+    agent = str(skill.get("agent") or "unknown")
+    component_type = str(skill.get("component_type") or "skill")
+    runtime_name = str(skill.get("runtime_name") or skill.get("name") or "unknown")
+    install_scope = str(skill.get("install_scope") or skill.get("scope") or "unknown")
+    source_file = str(skill.get("source_file") or "")
+    if not source_file and skill.get("path"):
+        source_file = os.path.join(str(skill.get("path")), "SKILL.md")
+    lexical = os.path.normpath(os.path.abspath(os.path.expanduser(source_file))) if source_file else ""
+    realpath = os.path.realpath(lexical) if lexical else ""
+    material = "\0".join((agent, component_type, runtime_name, install_scope, lexical, realpath))
+    return "%s::i::%s" % (agent, hashlib.sha256(material.encode("utf-8")).hexdigest()[:20])
 
 
 def load_inventory(path):
-    with open(path, 'r', encoding='utf-8') as f:
-        inv = json.load(f)
-    return {s.get('id'): s for s in (inv.get('skills') or []) if s.get('id')}
-
-
-def find_cases(out_dir, skill_id):
-    """扫 case 库，返回 ([(case_name, case_dir)], warnings)。只收含 prompt.md 的子目录。"""
-    root = os.path.join(out_dir, 'cases', skill_id)
-    cases, warns = [], []
-    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
-        d = os.path.join(root, name)
-        if not os.path.isdir(d):
+    """Load v2 inventory, adapting v1 records conservatively at the boundary."""
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        raise ValueError("inventory 顶层必须是 JSON object")
+    version = normalize_schema_version(document.get("schema_version"))
+    if version != "unknown":
+        major = version.split(".", 1)[0]
+        if major not in {"1", "2"}:
+            raise ValueError("不支持 inventory schema major %s" % major)
+    raw_skills = document.get("skills") or []
+    if not isinstance(raw_skills, list):
+        raise ValueError("inventory.skills 必须是 array")
+    adapted = []
+    legacy = version == "unknown" or version.startswith("1")
+    for raw in raw_skills:
+        if not isinstance(raw, dict):
             continue
-        if not os.path.isfile(os.path.join(d, 'prompt.md')):
-            warns.append('%s/%s: 缺 prompt.md，跳过该 case' % (skill_id, name))
+        skill = dict(raw)
+        skill.setdefault("component_type", "skill")
+        runtime_name = skill.get("runtime_name") or skill.get("name")
+        skill.setdefault("runtime_name", runtime_name)
+        skill.setdefault("name", runtime_name)
+        logical_id = skill.get("logical_id") or skill.get("id")
+        skill["logical_id"] = logical_id
+        skill["id"] = logical_id
+        source_file = skill.get("source_file")
+        if source_file and not isinstance(source_file, str):
+            # 非 str 的 source_file 视为无效，走回退路径；不把任意 JSON 值编造成路径
+            source_file = None
+        if not source_file and skill.get("path"):
+            source_file = os.path.join(str(skill.get("path")), "SKILL.md")
+        skill["source_file"] = source_file
+        if source_file and not skill.get("source_realpath"):
+            skill["source_realpath"] = os.path.realpath(source_file)
+        if not skill.get("instance_id"):
+            skill["instance_id"] = _legacy_instance_id(skill)
+        if "auditable" not in skill:
+            # A v1 input cannot prove runtime visibility.  It may still be evaluated when
+            # it exposes a concrete source file, but this is an inferred compatibility path.
+            skill["auditable"] = bool(legacy and source_file and os.path.isfile(source_file))
+        adapted.append(skill)
+    return adapted
+
+
+def resolve_skill_selectors(skills, selectors):
+    """Resolve exact instance IDs, then uniquely resolvable legacy logical IDs."""
+    by_instance = {}
+    by_logical = {}
+    for skill in skills:
+        instance_id = skill.get("instance_id")
+        if instance_id:
+            by_instance.setdefault(instance_id, []).append(skill)
+        logical_id = skill.get("logical_id") or skill.get("id")
+        if logical_id:
+            by_logical.setdefault(logical_id, []).append(skill)
+
+    resolved = []
+    problems = []
+    seen = set()
+    for selector in selectors:
+        candidates = by_instance.get(selector) or []
+        if len(candidates) > 1:
+            problems.append({
+                "code": "duplicate_instance_id",
+                "selector": selector,
+                "message": "inventory 中 instance_id 重复，无法安全关联",
+            })
             continue
-        cases.append((name, d))
-        if not os.path.isdir(os.path.join(d, 'graders')):
-            warns.append('%s/%s: 无 graders/，评分以 CLI 默认行为为准' % (skill_id, name))
-    return cases, warns
+        if not candidates:
+            candidates = by_logical.get(selector) or []
+            if len(candidates) > 1:
+                problems.append({
+                    "code": "ambiguous_skill_selector",
+                    "selector": selector,
+                    "message": "旧 logical id 命中 %d 个实例；请改传唯一 instance_id" % len(candidates),
+                })
+                continue
+        if not candidates:
+            problems.append({
+                "code": "skill_selector_not_found",
+                "selector": selector,
+                "message": "inventory 中找不到该 instance_id/logical id",
+            })
+            continue
+        skill = candidates[0]
+        if skill.get("auditable") is not True:
+            problems.append({
+                "code": "component_not_auditable",
+                "selector": selector,
+                "message": "该组件 auditable 不是 true，禁止进入付费评测",
+                "skill_instance_id": skill.get("instance_id"),
+            })
+            continue
+        instance_id = skill.get("instance_id")
+        if instance_id not in seen:
+            resolved.append(skill)
+            seen.add(instance_id)
+    return resolved, problems
 
 
-def assemble_pkg(pkg_dir, skill, cases):
-    """组装官方 plugin pkg（skill 目录只读，副本进临时区）。"""
-    name = sanitize(skill.get('name') or skill.get('id'))
-    src = skill.get('symlink_target') or skill.get('path')
-    if not src or not os.path.isdir(src):
-        raise OSError('skill 目录不存在：%s' % src)
+def _safe_child(root, child):
+    root_abs = os.path.abspath(root)
+    path = os.path.abspath(os.path.join(root_abs, str(child)))
+    try:
+        if os.path.commonpath((root_abs, path)) != root_abs:
+            return None
+    except ValueError:
+        return None
+    return path
+
+
+def find_cases(out_dir, skill):
+    """Find deterministic case directories, preferring the canonical instance ID."""
+    cases_root = os.path.join(out_dir, "cases")
+    identifiers = [skill.get("instance_id"), skill.get("logical_id") or skill.get("id")]
+    root = None
+    used_identifier = None
+    for identifier in identifiers:
+        if not identifier:
+            continue
+        candidate = _safe_child(cases_root, identifier)
+        if candidate and os.path.isdir(candidate):
+            root = candidate
+            used_identifier = identifier
+            break
+    warnings = []
+    if root is None:
+        return [], warnings
+    if used_identifier != skill.get("instance_id"):
+        warnings.append(
+            "%s: case 库沿用旧 logical id 路径；建议迁移到 instance_id 路径"
+            % skill.get("instance_id")
+        )
+    cases = []
+    for name in sorted(os.listdir(root)):
+        case_dir = os.path.join(root, name)
+        if not os.path.isdir(case_dir):
+            continue
+        if not os.path.isfile(os.path.join(case_dir, "prompt.md")):
+            warnings.append("%s/%s: 缺 prompt.md，跳过" % (used_identifier, name))
+            continue
+        cases.append((name, case_dir))
+        if not os.path.isdir(os.path.join(case_dir, "graders")):
+            warnings.append("%s/%s: 无 graders/；官方默认评分仍可能产生付费 judge" % (used_identifier, name))
+    return cases, warnings
+
+
+def source_root_for(skill):
+    source_file = skill.get("source_file")
+    path = skill.get("symlink_target") or skill.get("path")
+    if source_file and os.path.isfile(source_file):
+        if os.path.basename(source_file).lower() == "skill.md":
+            return os.path.dirname(source_file)
+        if path and os.path.isdir(path):
+            return path
+        return os.path.dirname(source_file)
+    if path and os.path.isdir(path):
+        return path
+    return None
+
+
+def _ignored_file(name):
+    return any(fnmatch.fnmatch(name, pattern) for pattern in IGNORE_FILE_PATTERNS)
+
+
+def _hash_tree(hasher, label, root):
+    if not root or not os.path.isdir(root):
+        raise OSError("目录不存在：%s" % root)
+    root_abs = os.path.abspath(root)
+    hasher.update(("TREE\0%s\0" % label).encode("utf-8"))
+    for current, dirnames, filenames in os.walk(root_abs, followlinks=False):
+        dirnames[:] = sorted(name for name in dirnames if name not in IGNORE_DIR_NAMES)
+        rel_dir = os.path.relpath(current, root_abs)
+        for dirname in list(dirnames):
+            full = os.path.join(current, dirname)
+            if os.path.islink(full):
+                rel = os.path.normpath(os.path.join(rel_dir, dirname)).replace(os.sep, "/")
+                hasher.update(("DLINK\0%s\0%s\0" % (rel, os.readlink(full))).encode("utf-8"))
+        for filename in sorted(filenames):
+            if _ignored_file(filename):
+                continue
+            full = os.path.join(current, filename)
+            rel = os.path.normpath(os.path.join(rel_dir, filename)).replace(os.sep, "/")
+            if rel.startswith("./"):
+                rel = rel[2:]
+            hasher.update(("FILE\0%s\0" % rel).encode("utf-8"))
+            if os.path.islink(full):
+                hasher.update(("LINK\0%s\0" % os.readlink(full)).encode("utf-8"))
+            try:
+                with open(full, "rb") as handle:
+                    while True:
+                        block = handle.read(1024 * 1024)
+                        if not block:
+                            break
+                        hasher.update(block)
+            except OSError as exc:
+                raise OSError("无法读取指纹文件 %s：%s" % (full, exc))
+            hasher.update(b"\0END\0")
+
+
+def compute_fingerprint(skill_instance_id, source_root, cases, runs, execution_model,
+                        judge_model, ablation_mode, claude_version,
+                        schema_versions=SUPPORTED_EVAL_SCHEMA_VERSIONS):
+    """Hash every cache-relevant input; no path or label is treated as executable."""
+    metadata = {
+        "skill_instance_id": skill_instance_id,
+        "runs": runs,
+        "execution_model": execution_model,
+        "judge_model": judge_model or DEFAULT_JUDGE_SENTINEL,
+        "ablation_mode": ablation_mode,
+        "claude_version": claude_version,
+        "supported_eval_schema_versions": list(schema_versions),
+    }
+    hasher = hashlib.sha256()
+    hasher.update(json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    _hash_tree(hasher, "skill", source_root)
+    for case_name, case_dir in sorted(cases, key=lambda item: item[0]):
+        _hash_tree(hasher, "case:%s" % case_name, case_dir)
+    return hasher.hexdigest()
+
+
+def _assert_below(path, root):
+    path_abs = os.path.abspath(path)
+    root_abs = os.path.abspath(root)
+    try:
+        ok = os.path.commonpath((path_abs, root_abs)) == root_abs
+    except ValueError:
+        ok = False
+    if not ok:
+        raise OSError("拒绝写出 --out-dir：%s" % path)
+
+
+def assemble_pkg(pkg_dir, out_dir, skill, cases):
+    """Assemble an isolated plugin package below out_dir, never touching the source."""
+    _assert_below(pkg_dir, out_dir)
+    source_root = source_root_for(skill)
+    source_file = skill.get("source_file")
+    if not source_root:
+        raise OSError("组件来源目录不存在")
     if os.path.isdir(pkg_dir):
         shutil.rmtree(pkg_dir)
-    os.makedirs(os.path.join(pkg_dir, '.claude-plugin'))
-    with open(os.path.join(pkg_dir, '.claude-plugin', 'plugin.json'), 'w', encoding='utf-8') as f:
-        json.dump({'name': name + '-test'}, f)
-    shutil.copytree(src, os.path.join(pkg_dir, 'skills', name), ignore=COPY_IGNORE)
-    for cname, cdir in cases:
-        shutil.copytree(cdir, os.path.join(pkg_dir, 'evals', cname), ignore=COPY_IGNORE)
-    return name
+    manifest_dir = os.path.join(pkg_dir, ".claude-plugin")
+    os.makedirs(manifest_dir)
+    component_name = skill.get("component_name") or skill.get("runtime_name") or skill.get("name") or "skill"
+    package_name = sanitize(component_name)
+    with open(os.path.join(manifest_dir, "plugin.json"), "w", encoding="utf-8") as handle:
+        json.dump({"name": package_name + "-test"}, handle, ensure_ascii=False)
+    destination = os.path.join(pkg_dir, "skills", package_name)
+    if source_file and os.path.isfile(source_file) and os.path.basename(source_file).lower() != "skill.md":
+        os.makedirs(destination)
+        shutil.copy2(source_file, os.path.join(destination, "SKILL.md"))
+    else:
+        shutil.copytree(source_root, destination, ignore=COPY_IGNORE)
+    for case_name, case_dir in cases:
+        shutil.copytree(case_dir, os.path.join(pkg_dir, "evals", case_name), ignore=COPY_IGNORE)
+    return package_name
 
 
-def cli_command(runs, budget, raw_path):
-    return [CLI_BIN, 'plugin', 'eval', '.', '--runs', str(runs), '--max-cost-usd', str(budget),
-            '--no-publish', '--trust-plugin', '--json', raw_path]
+def cli_command(runs, budget, raw_path, execution_model, judge_model=None,
+                ablation_mode=DEFAULT_ABLATION):
+    command = [
+        CLI_BIN,
+        "plugin",
+        "eval",
+        ".",
+        "--runs",
+        str(runs),
+        "--max-cost-usd",
+        str(budget),
+        "--no-publish",
+        "--trust-plugin",
+        "--json",
+        raw_path,
+        "--model",
+        execution_model,
+        "--concurrency",
+        "1",
+        "--ablation",
+        ablation_mode,
+    ]
+    if judge_model:
+        command.extend(("--judge-model", judge_model))
+    return command
 
 
-def run_cli(pkg_dir, runs, budget, raw_path):
-    """跑官方 CLI，返回 (ok, detail)。超时/启动失败/非零 exit 返回失败详情。"""
-    limit = 60 + runs * 300
+def run_cli(pkg_dir, command, timeout_seconds):
+    """Execute one fixed argv list.  Never use shell=True or cached command strings."""
     try:
-        p = subprocess.run(cli_command(runs, budget, raw_path), cwd=pkg_dir,
-                           capture_output=True, text=True, timeout=limit)
+        process = subprocess.run(
+            command,
+            cwd=pkg_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        return {
+            "started": True,
+            "returncode": process.returncode,
+            "timed_out": False,
+            "launch_error": None,
+        }
     except subprocess.TimeoutExpired:
-        return False, 'CLI 超时（>%ds）被杀' % limit
-    except OSError as e:
-        return False, '无法启动 %s：%s' % (CLI_BIN, e)
-    if p.returncode != 0:
-        tail = (p.stderr or p.stdout or '').strip().splitlines()
-        return False, 'CLI exit %d：%s' % (p.returncode, tail[-1] if tail else '(无输出)')
-    return True, ''
+        return {
+            "started": True,
+            "returncode": None,
+            "timed_out": True,
+            "launch_error": None,
+        }
+    except OSError as exc:
+        return {
+            "started": False,
+            "returncode": None,
+            "timed_out": False,
+            "launch_error": "%s: %s" % (exc.__class__.__name__, exc),
+        }
 
 
-def arm_mean(runs):
-    """臂均分 = run.score 平均；无 run/无分数 → None。"""
-    scores = [r.get('score') for r in (runs or []) if isinstance(r.get('score'), (int, float))]
-    return round(sum(scores) / len(scores), 3) if scores else None
+def load_capability_cache(path):
+    """Read a strict data-only cache; command/probe fields are intentionally ignored."""
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError("capability cache 顶层必须是 JSON object")
+    result = {}
+    schema_version = clean_text(raw.get("schema_version"))
+    claude_version = clean_text(raw.get("claude_version"))
+    if schema_version:
+        result["schema_version"] = schema_version
+    if claude_version:
+        result["claude_version"] = claude_version
+    allowed_supports = {"plugin_eval", "model", "judge_model", "concurrency", "ablation"}
+    supports = raw.get("supports")
+    if isinstance(supports, dict):
+        safe_supports = {
+            key: value for key, value in supports.items()
+            if key in allowed_supports and isinstance(value, bool)
+        }
+        if safe_supports:
+            result["supports"] = safe_supports
+    return result
 
 
-def judge(mw, mwo, delta):
-    """机械判定（判定表见 case-authoring.md；最终判定权在 Agent）。"""
-    if mw < LOW_SCORE and mwo < LOW_SCORE:
-        return 'inconclusive', '两份答卷均低分，case 可能出坏（回炉重出，别下结论）'
+def query_claude_version(timeout_seconds=10):
+    """Use one fixed, free argv probe; return (version, error)."""
+    try:
+        process = subprocess.run(
+            [CLI_BIN, "--version"], capture_output=True, text=True, timeout=timeout_seconds
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, "%s: %s" % (exc.__class__.__name__, exc)
+    if process.returncode != 0:
+        return None, "claude --version exit %d" % process.returncode
+    lines = (process.stdout or process.stderr or "").strip().splitlines()
+    version = lines[0].strip() if lines else ""
+    return (version[:200], None) if version else (None, "claude --version 未返回版本")
+
+
+def judge(with_score, without_score, delta):
+    if with_score < LOW_SCORE and without_score < LOW_SCORE:
+        return "inconclusive", "两臂均低分，case/grader 可能失效"
     if delta > DELTA_FLAT:
-        return 'valuable', 'with 明显高于 without'
+        return "valuable", "官方 Δ 显示 with 明显高于 without"
     if delta < -DELTA_FLAT:
-        return 'inconclusive', '反常（with<without）：先查 judge 再查 skill 是否干扰'
-    return 'suspected_native_coverage', 'Δ≈0，疑似模型已原生覆盖（须人工复核）'
+        return "inconclusive", "with 低于 without，先查 judge 与 skill 干扰"
+    return "suspected_native_coverage", "官方 Δ 接近平，仍须人工复核 case 区分度"
+
+
+def _contains_true_flag(node, key):
+    if isinstance(node, dict):
+        if node.get(key) is True:
+            return True
+        return any(_contains_true_flag(value, key) for value in node.values())
+    if isinstance(node, list):
+        return any(_contains_true_flag(value, key) for value in node)
+    return False
+
+
+def _run_failed(run):
+    if not isinstance(run, dict):
+        return True
+    if run.get("error") not in (None, "", False):
+        return True
+    status = str(run.get("status") or "").lower()
+    return status in {"error", "failed", "cancelled", "canceled"}
+
+
+def _dedupe(items):
+    result = []
+    seen = set()
+    for item in items:
+        text = str(item)
+        if text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def _raw_case_name(case):
+    return clean_text(case.get("name")) or clean_text(case.get("id")) or "?"
+
+
+def _case_result(raw_case, effective_model, ablation_mode):
+    name = _raw_case_name(raw_case)
+    arms = raw_case.get("arms") if isinstance(raw_case.get("arms"), dict) else {}
+    with_present = "with" in arms and isinstance(arms.get("with"), list)
+    without_present = "without" in arms and isinstance(arms.get("without"), list)
+    with_runs = arms.get("with") if with_present else []
+    without_runs = arms.get("without") if without_present else []
+    aggregates = raw_case.get("aggregates") if isinstance(raw_case.get("aggregates"), dict) else {}
+    with_score = aggregates.get("score") if is_number(aggregates.get("score")) else None
+    without_score = aggregates.get("scoreWithout") if is_number(aggregates.get("scoreWithout")) else None
+    delta = aggregates.get("delta") if is_number(aggregates.get("delta")) else None
+    skipped = _contains_true_flag(raw_case, "skippedPaidGraders")
+    failures = []
+    run_error = False
+    for arm_name, runs in (("with", with_runs), ("without", without_runs)):
+        for index, run in enumerate(runs, 1):
+            if _run_failed(run):
+                run_error = True
+                failures.append("%s run %d failed" % (arm_name, index))
+    case_status = str(raw_case.get("status") or "").lower()
+    if case_status in {"error", "failed"} or raw_case.get("error") not in (None, "", False):
+        run_error = True
+        failures.append("case reported an error")
+
+    incomplete = []
+    if not with_present or not with_runs:
+        incomplete.append("missing with arm")
+    if with_score is None:
+        incomplete.append("missing official aggregates.score")
+    if ablation_mode == "with-without":
+        if not without_present or not without_runs:
+            incomplete.append("missing without arm")
+        if without_score is None:
+            incomplete.append("missing official aggregates.scoreWithout")
+        if delta is None:
+            incomplete.append("missing official aggregates.delta")
+    else:
+        incomplete.append("ablation none has no comparable baseline arm")
+    if skipped:
+        incomplete.append("skippedPaidGraders=true")
+
+    if run_error:
+        status = "error"
+    elif incomplete:
+        status = "incomplete"
+    else:
+        status = "complete"
+    return {
+        "name": name,
+        "effective_model": effective_model or "unknown",
+        "status": status,
+        "with_score": with_score,
+        "without_score": without_score,
+        "delta": delta,
+        "with_runs": len(with_runs),
+        "without_runs": len(without_runs),
+        "skipped_paid_graders": skipped,
+        "errors": _dedupe(failures + incomplete),
+    }
+
+
+def parse_raw_result(raw, expected_case_names, requested_model, ablation_mode,
+                     raw_path, forced_partial_reason=None, requested_judge_model=None):
+    """Validate official raw JSON and derive a result without rebuilding official scores."""
+    if not isinstance(raw, dict):
+        raise ValueError("eval raw 顶层必须是 JSON object")
+    source_schema = normalize_schema_version(raw.get("schemaVersion"))
+    known_schema = source_schema in SUPPORTED_EVAL_SCHEMA_VERSIONS
+    suite = raw.get("suite") if isinstance(raw.get("suite"), dict) else {}
+    suite_model = clean_text(suite.get("modelOverride"))
+    raw_cases = raw.get("cases") if isinstance(raw.get("cases"), list) else []
+    case_models = []
+    by_name = {}
+    duplicate_names = set()
+    for raw_case in raw_cases:
+        if not isinstance(raw_case, dict):
+            continue
+        name = _raw_case_name(raw_case)
+        if name in by_name:
+            duplicate_names.add(name)
+        else:
+            by_name[name] = raw_case
+        model = suite_model or clean_text(raw_case.get("model"))
+        if model:
+            case_models.append(model)
+
+    if suite_model:
+        actual_model = suite_model
+    else:
+        distinct_models = sorted(set(case_models))
+        if len(distinct_models) == 1:
+            actual_model = distinct_models[0]
+        elif len(distinct_models) > 1:
+            actual_model = "mixed"
+        else:
+            actual_model = "unknown"
+
+    judge_model = (
+        clean_text(suite.get("judgeModelOverride"))
+        or clean_text(suite.get("judgeModel"))
+        or clean_text(raw.get("judgeModel"))
+        or clean_text(requested_judge_model)
+        or DEFAULT_JUDGE_SENTINEL
+    )
+    cases_out = []
+    blockers = []
+    expected = list(expected_case_names)
+    for name in expected:
+        raw_case = by_name.get(name)
+        if raw_case is None:
+            cases_out.append({
+                "name": name,
+                "effective_model": suite_model or "unknown",
+                "status": "incomplete",
+                "with_score": None,
+                "without_score": None,
+                "delta": None,
+                "with_runs": 0,
+                "without_runs": 0,
+                "skipped_paid_graders": False,
+                "errors": ["raw missing expected case"],
+            })
+            blockers.append("缺 case: %s" % name)
+            continue
+        effective_model = suite_model or clean_text(raw_case.get("model")) or "unknown"
+        parsed_case = _case_result(raw_case, effective_model, ablation_mode)
+        cases_out.append(parsed_case)
+        if parsed_case["status"] != "complete":
+            blockers.append("case %s %s" % (name, parsed_case["status"]))
+    extras = sorted(name for name in by_name if name not in set(expected))
+    if extras:
+        blockers.append("raw 含未请求 case: %s" % ",".join(extras))
+    if duplicate_names:
+        blockers.append("raw case 名重复: %s" % ",".join(sorted(duplicate_names)))
+    if not expected:
+        blockers.append("未声明预期 case")
+    if not known_schema:
+        blockers.append("不支持 raw schemaVersion=%s" % source_schema)
+    raw_partial = raw.get("partial") is True
+    if raw_partial:
+        blockers.append(clean_text(raw.get("partialReason")) or "raw partial=true")
+    if forced_partial_reason:
+        blockers.append(forced_partial_reason)
+    if raw.get("error") not in (None, "", False):
+        blockers.append("raw 顶层报告 error")
+    if raw.get("errors"):
+        blockers.append("raw 顶层报告 errors")
+    if _contains_true_flag(raw, "skippedPaidGraders"):
+        blockers.append("存在 skippedPaidGraders=true")
+    if actual_model in {"unknown", "mixed"}:
+        blockers.append("effective model=%s" % actual_model)
+    if requested_model and actual_model != requested_model:
+        blockers.append("请求模型 %s 与实际模型 %s 不一致" % (requested_model, actual_model))
+
+    cost = raw.get("costUsd") if is_number(raw.get("costUsd")) and raw.get("costUsd") >= 0 else None
+    duration = raw.get("durationSeconds") if is_number(raw.get("durationSeconds")) and raw.get("durationSeconds") >= 0 else None
+    if cost is None:
+        blockers.append("costUsd 缺失或无效")
+
+    official_delta = None
+    top_aggregates = raw.get("aggregates") if isinstance(raw.get("aggregates"), dict) else {}
+    if is_number(top_aggregates.get("meanDelta")):
+        official_delta = top_aggregates.get("meanDelta")
+    elif is_number(top_aggregates.get("delta")):
+        official_delta = top_aggregates.get("delta")
+    elif len(cases_out) == 1 and is_number(cases_out[0].get("delta")):
+        # This remains an official case aggregate, not a mean rebuilt from run scores.
+        official_delta = cases_out[0]["delta"]
+    else:
+        blockers.append("缺官方 suite aggregate delta")
+
+    blockers = _dedupe(blockers)
+    partial = bool(blockers)
+    if partial:
+        delta = None
+        verdict = "inconclusive"
+        note = "；".join(blockers)
+        evidence = "评测证据不完整，禁止判分：%s；raw：%s" % (note, raw_path)
+        status = "partial"
+    else:
+        delta = round(float(official_delta), 6)
+        with_scores = [case["with_score"] for case in cases_out]
+        without_scores = [case["without_score"] for case in cases_out]
+        mean_with = sum(with_scores) / len(with_scores)
+        mean_without = sum(without_scores) / len(without_scores)
+        verdict, note = judge(mean_with, mean_without, delta)
+        evidence = (
+            "official aggregates: with=%.3f without=%.3f Δ=%.3f（%d case）；"
+            "effective model=%s；%s；raw：%s"
+            % (mean_with, mean_without, delta, len(cases_out), actual_model, note, raw_path)
+        )
+        status = "complete"
+    cacheable = bool(
+        status == "complete"
+        and requested_model
+        and actual_model == requested_model
+        and actual_model not in {"unknown", "mixed"}
+        and known_schema
+        and cost is not None
+    )
+    return {
+        "status": status,
+        "requested_model": requested_model,
+        "model": actual_model,
+        "judge_model": judge_model,
+        "source_schema_version": source_schema,
+        "cases": cases_out,
+        "delta": delta,
+        "verdict": verdict,
+        "evidence": evidence,
+        "cost_usd": cost,
+        "duration_seconds": duration,
+        "partial": partial,
+        "partial_reason": "；".join(blockers) if blockers else None,
+        "error": None,
+        "cacheable": cacheable,
+    }
 
 
 def parse_result(raw, raw_path):
-    """raw CLI 结果 → 契约条目字段（含机械判定与证据链）。"""
-    cases_out, pairs = [], []
-    for c in raw.get('cases') or []:
-        arms = c.get('arms') or {}
-        w, wo = arm_mean(arms.get('with')), arm_mean(arms.get('without'))
-        cases_out.append({'name': c.get('name') or c.get('id') or '?',
-                          'with_score': w, 'without_score': wo})
-        if w is not None and wo is not None:
-            pairs.append((w, wo))
-    if pairs:
-        mw = sum(p[0] for p in pairs) / len(pairs)
-        mwo = sum(p[1] for p in pairs) / len(pairs)
-        delta = round(mw - mwo, 3)
-        verdict, note = judge(mw, mwo, delta)
-        evidence = ('with=%.2f without=%.2f Δ=%.2f（%d/%d case 两份答卷齐）%s；raw：%s（机械判定，'
-                    '最终由 Agent 复核）' % (mw, mwo, delta, len(pairs), len(cases_out), note, raw_path))
-    else:
-        delta, verdict = None, 'inconclusive'
-        evidence = '无可配对的两份答卷分数（cases=%d）；raw：%s' % (len(cases_out), raw_path)
-    model = raw.get('model') or (raw.get('meta') or {}).get('model') or 'unknown'
-    return {'cases': cases_out, 'delta': delta, 'verdict': verdict, 'evidence': evidence,
-            'cost_usd': raw.get('costUsd'), 'duration_seconds': raw.get('durationSeconds'),
-            'model': model}
+    """Backward-compatible helper for callers that already hold one raw document."""
+    names = [_raw_case_name(case) for case in (raw.get("cases") or []) if isinstance(case, dict)]
+    return parse_raw_result(raw, names, None, DEFAULT_ABLATION, raw_path)
 
 
-def fake_result(skill_id, case_names, runs):
-    """dry-run 假 CLI 结果（结构对齐 spike S3 实测），供真解析路径跑通。"""
-    def arm(scores):
-        return [{'score': s, 'graders': [{'name': 'check', 'passed': s >= 0.8}]} for s in scores]
+def fake_result(case_names, model, judge_model, ablation_mode):
     cases = []
-    for i, cname in enumerate(case_names):
-        w = [1.0 if (r + i) % 3 else 0.8 for r in range(runs)]
-        wo = [0.4 if (r + i) % 2 else 0.2 for r in range(runs)]
-        cases.append({'name': cname, 'arms': {'with': arm(w), 'without': arm(wo)},
-                      'aggregates': {'delta': round(sum(w) / len(w) - sum(wo) / len(wo), 3)}})
-    mean_d = round(sum(c['aggregates']['delta'] for c in cases) / len(cases), 2) if cases else 0.0
-    return {'dry_run_fake': True, 'skill_id': skill_id, 'costUsd': 0.62 * max(1, len(cases)),
-            'durationSeconds': 330 * max(1, len(cases)), 'cases': cases, 'aggregates': {'meanDelta': mean_d}}
+    for name in case_names:
+        arms = {"with": [{"score": 0.9}]}
+        aggregate = {"score": 0.9}
+        if ablation_mode == "with-without":
+            arms["without"] = [{"score": 0.5}]
+            aggregate.update({"scoreWithout": 0.5, "delta": 0.4})
+        cases.append({"name": name, "model": model, "arms": arms, "aggregates": aggregate})
+    raw = {
+        "schemaVersion": 1,
+        "suite": {"modelOverride": model},
+        "costUsd": 0.0,
+        "durationSeconds": 0.0,
+        "partial": False,
+        "cases": cases,
+        "aggregates": {"meanDelta": 0.4} if ablation_mode == "with-without" else {},
+        "dryRunFake": True,
+    }
+    if judge_model:
+        raw["suite"]["judgeModel"] = judge_model
+    return raw
 
 
-def cache_valid(entry, cur_model):
-    """缓存可沿用：有完整结果且模型未变（当前未知=默认未变；已知须与缓存严格相等）。"""
-    if not entry or entry.get('error') or not entry.get('cases'):
-        return False
-    return (entry.get('model') or 'unknown') == cur_model if cur_model != 'unknown' else True
+def _result_identity(skill):
+    return {
+        "skill_instance_id": skill.get("instance_id"),
+        "skill_id": skill.get("logical_id") or skill.get("id"),
+    }
 
 
-def fail(entry, errors, stage, detail):
-    entry.update(error=detail, verdict='inconclusive', evidence='未完成 eval：%s' % detail)
-    errors.append({'skill_id': entry['skill_id'], 'stage': stage, 'detail': detail})
+def base_result(skill, requested_model, requested_judge_model, claude_version,
+                fingerprint, runs):
+    result = _result_identity(skill)
+    result.update({
+        "status": "error",
+        "prescreen": dict(PRESCREEN),
+        "requested_model": requested_model,
+        "model": "unknown",
+        "judge_model": requested_judge_model or DEFAULT_JUDGE_SENTINEL,
+        "claude_version": claude_version,
+        "source_schema_version": None,
+        "fingerprint": fingerprint,
+        "cache_hit": False,
+        "cacheable": False,
+        "raw_result_path": None,
+        "cases": [],
+        "delta": None,
+        "verdict": "inconclusive",
+        "evidence": "",
+        "cost_usd": 0.0,
+        "cost_usd_this_run": 0.0,
+        "duration_seconds": None,
+        "partial": False,
+        "partial_reason": None,
+        "error": None,
+        "runs": runs,
+    })
+    return result
+
+
+def set_result_error(result, message, status="error", partial=False, cost_unknown=False):
+    result.update({
+        "status": status,
+        "verdict": "inconclusive",
+        "delta": None,
+        "evidence": "内容价值未完成验证：%s" % message,
+        "partial": partial,
+        "partial_reason": message if partial else None,
+        "error": message,
+        "cacheable": False,
+    })
+    if cost_unknown:
+        result["cost_usd"] = None
+        result["cost_usd_this_run"] = None
+    return result
+
+
+def unsupported_result(skill, requested_model, requested_judge_model, runs,
+                       runtime_agent):
+    material = json.dumps(
+        {
+            "instance": skill.get("instance_id"),
+            "runtime": runtime_agent,
+            "model": requested_model,
+            "runs": runs,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    result = base_result(
+        skill,
+        requested_model,
+        requested_judge_model,
+        None,
+        hashlib.sha256(material.encode("utf-8")).hexdigest(),
+        runs,
+    )
+    result.update({
+        "status": "unsupported_runtime",
+        "verdict": "content_value_unverified",
+        "evidence": "运行时 %s 未注册付费评测后端；未调用 Claude，内容价值未验证" % runtime_agent,
+        "cost_usd": 0.0,
+        "cost_usd_this_run": 0.0,
+        "partial": False,
+        "error": None,
+    })
+    return result
+
+
+def structured_error(code, stage, message, skill=None, selector=None):
+    return {
+        "code": code,
+        "stage": stage,
+        "skill_instance_id": skill.get("instance_id") if skill else None,
+        "skill_id": (skill.get("logical_id") or skill.get("id")) if skill else selector,
+        "detail": message,
+    }
+
+
+def raw_parent(out_dir, skill_instance_id, execution_model, fingerprint):
+    return os.path.join(
+        out_dir,
+        "eval-raw",
+        safe_component(skill_instance_id),
+        safe_component(execution_model),
+        fingerprint,
+    )
+
+
+def next_attempt_path(parent):
+    os.makedirs(parent, exist_ok=True)
+    index = 1
+    while True:
+        path = os.path.join(parent, "attempt-%04d.json" % index)
+        if not os.path.exists(path):
+            return path
+        index += 1
+
+
+def cache_path_for(parent):
+    return os.path.join(parent, "cache-result.json")
+
+
+def load_exact_cache(path, fingerprint, skill_instance_id, requested_model,
+                     claude_version):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            wrapper = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(wrapper, dict) or wrapper.get("cache_schema_version") != "1":
+        return None
+    expected = {
+        "fingerprint": fingerprint,
+        "skill_instance_id": skill_instance_id,
+        "requested_model": requested_model,
+        "claude_version": claude_version,
+    }
+    if any(wrapper.get(key) != value for key, value in expected.items()):
+        return None
+    result = wrapper.get("result")
+    if not isinstance(result, dict):
+        return None
+    if result.get("cacheable") is not True or result.get("model") in {None, "unknown", "mixed"}:
+        return None
+    if result.get("model") != requested_model or result.get("status") != "complete":
+        return None
+    raw_path = result.get("raw_result_path")
+    if not raw_path or not os.path.isfile(raw_path):
+        return None
+    cached = dict(result)
+    cached["status"] = "cached"
+    cached["cache_hit"] = True
+    cached["cost_usd_this_run"] = 0.0
+    cached["error"] = None
+    return cached
+
+
+def write_exact_cache(path, result):
+    wrapper = {
+        "cache_schema_version": "1",
+        "fingerprint": result.get("fingerprint"),
+        "skill_instance_id": result.get("skill_instance_id"),
+        "requested_model": result.get("requested_model"),
+        "claude_version": result.get("claude_version"),
+        "result": result,
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = path + ".tmp-%d" % os.getpid()
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(wrapper, handle, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+
+def aggregate_value(results, key, default="unknown"):
+    values = []
+    for result in results:
+        value = result.get(key)
+        if value and value not in {"unknown", None}:
+            values.append(value)
+    distinct = sorted(set(values))
+    if not distinct:
+        return default
+    if len(distinct) == 1:
+        return distinct[0]
+    return "mixed"
+
+
+def overall_status(results, runtime_agent, dry_run, cost_verification):
+    if runtime_agent != "claude-code":
+        return "unsupported_runtime"
+    if dry_run:
+        return "dry_run"
+    if cost_verification == "incomplete":
+        return "error"
+    statuses = {result.get("status") for result in results}
+    if "partial" in statuses:
+        return "partial"
+    if "error" in statuses:
+        return "error"
+    if statuses and statuses.issubset({"complete", "cached"}):
+        return "complete"
+    return "error"
+
+
+def write_json(path, document):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = path + ".tmp-%d" % os.getpid()
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+
+def build_document(args, runtime_agent, backend, total_budget, spent, results,
+                   errors, warnings, cost_verification):
+    status = overall_status(results, runtime_agent, args.dry_run, cost_verification)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "schema_name": SCHEMA_NAME,
+        "evaluated_at": now_iso(),
+        "model": aggregate_value(results, "model"),
+        "budget_usd": args.max_cost_usd,
+        "total_budget_usd": total_budget,
+        "total_cost_usd": round(spent, 6),
+        "cost_note": COST_NOTE,
+        "runs": args.runs,
+        "dry_run": args.dry_run,
+        "runtime_agent": runtime_agent,
+        "backend": backend,
+        "status": status,
+        "requested_model": args.model,
+        "requested_judge_model": args.judge_model,
+        "judge_model": aggregate_value(results, "judge_model", DEFAULT_JUDGE_SENTINEL),
+        "concurrency": 1,
+        "ablation_mode": args.ablation,
+        "cost_scope": "this_run_only",
+        "cost_verification": cost_verification,
+        "results": results,
+        "errors": errors,
+        "warnings": _dedupe(warnings),
+    }
+
+
+def _parse_selectors(value):
+    return [item for item in re.split(r"[,\s]+", value or "") if item]
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(
-        description='深度评测编排：组装临时 plugin pkg 逐 skill 跑官方对比考试，写 02-eval-results.json'
-                    '（契约见 CONTRACT.md）。对 skill 目录只读；预算为单 skill 硬顶传给 CLI。')
-    ap.add_argument('--skills', required=True, help='逗号分隔 skill id（01-metrics.json 高嫌疑名单）')
-    ap.add_argument('--inventory', default=None,
-                    help='00-inventory.json（取 skill 实际目录），默认 <out-dir>/00-inventory.json（B2：随 --out-dir 联动）')
-    ap.add_argument('--out-dir', default='skill-audit-output', help='输出目录（case 库 <out-dir>/cases/ 也在其中），默认：%(default)s')
-    ap.add_argument('--max-cost-usd', type=float, default=DEFAULT_BUDGET, help='传 CLI 的单 skill 成本硬顶 USD，默认：%(default)s')
-    ap.add_argument('--total-budget-usd', type=float, default=None,
-                    help='本次运行总预算硬顶 USD；省略时等于单 skill 上限 × skill 数')
-    ap.add_argument('--runs', type=int, default=DEFAULT_RUNS, help='每 case 每臂运行次数，默认：%(default)s')
-    ap.add_argument('--skip-cached', action='store_true', help='02 已有该 skill 有效结果且模型未变（配 --model）则跳过')
-    ap.add_argument('--model', default='unknown', help='当前运行时模型名（缓存比对；默认 unknown=视为未变）')
-    ap.add_argument('--dry-run', action='store_true', help='不调 CLI：组装 pkg+打印命令+假结果走全链路，写 02-eval-results.dry-run.json')
-    ap.add_argument('--keep-temp', action='store_true', help='保留 .eval-tmp 临时 pkg（调试）')
-    ap.add_argument('--json', action='store_true', help='stdout 追加机器可读运行摘要')
-    args = ap.parse_args(argv)
+    parser = argparse.ArgumentParser(
+        description=(
+            "按运行时路由官方对比评测；Claude Code 后端固定串行并透传 execution model。"
+            "其他运行时零成本输出 content_value_unverified。"
+        )
+    )
+    parser.add_argument("--skills", required=True, help="逗号或空白分隔的 instance_id；旧 logical id 仅唯一时可用")
+    parser.add_argument("--inventory", default=None, help="00-inventory.json；默认 <out-dir>/00-inventory.json")
+    parser.add_argument("--out-dir", default="skill-audit-output", help="唯一允许写入的输出目录")
+    parser.add_argument("--max-cost-usd", type=float, default=DEFAULT_BUDGET, help="每次 CLI 启动上限 USD")
+    parser.add_argument("--total-budget-usd", type=float, default=None, help="本次所有新启动评测的启动上限 USD")
+    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS, help="每 case 每臂运行次数")
+    parser.add_argument("--skip-cached", action="store_true", help="只复用 fingerprint 完全一致的精确缓存")
+    parser.add_argument("--model", default=None, help="execution model；Claude 非 dry-run 必须显式提供")
+    parser.add_argument("--judge-model", default=None, help="可选 judge model；不提供时不向 CLI 传该参数")
+    parser.add_argument("--ablation", choices=("with-without", "none"), default=DEFAULT_ABLATION)
+    parser.add_argument("--runtime-agent", choices=("auto", "claude-code", "other"), default="auto")
+    parser.add_argument("--capability-cache", default=None, help="可选只读 JSON 数据缓存；不接受命令字段")
+    parser.add_argument("--dry-run", action="store_true", help="不调用 Claude；仅在 claude-code 路由下组装并走假 raw")
+    parser.add_argument("--keep-temp", action="store_true", help="保留 out-dir/.eval-tmp 临时包")
+    parser.add_argument("--json", action="store_true", help="stdout 追加机器可读摘要")
+    args = parser.parse_args(argv)
+
     if args.runs <= 0:
-        ap.error('--runs 必须大于 0')
+        parser.error("--runs 必须大于 0")
+    # NaN/inf 满足 <=0 == False 会绕过下限检查，再经 min()/str() 进入付费 CLI argv——
+    # 预算闸门必须拒绝一切非有限值
+    if not math.isfinite(args.max_cost_usd):
+        parser.error("--max-cost-usd 必须是有限正数（拒绝 nan/inf）")
     if args.max_cost_usd <= 0:
-        ap.error('--max-cost-usd 必须大于 0')
-    if args.total_budget_usd is not None and args.total_budget_usd <= 0:
-        ap.error('--total-budget-usd 必须大于 0')
-    if args.inventory is None:  # B2：--inventory 默认值随 --out-dir 联动（默认 out-dir 时与旧行为一致）
-        args.inventory = os.path.join(args.out_dir, '00-inventory.json')
+        parser.error("--max-cost-usd 必须大于 0")
+    if args.total_budget_usd is not None:
+        if not math.isfinite(args.total_budget_usd):
+            parser.error("--total-budget-usd 必须是有限正数（拒绝 nan/inf）")
+        if args.total_budget_usd <= 0:
+            parser.error("--total-budget-usd 必须大于 0")
+    runtime_agent, backend = route_runtime_agent(args.runtime_agent)
+    if backend == "claude-plugin-eval" and not args.dry_run and not concrete_model(args.model):
+        parser.error("Claude Code 非 dry-run 评测必须显式提供 concrete --model，且不能是 unknown/mixed/auto/default")
 
     out_dir = os.path.abspath(args.out_dir)
-    raw_dir, tmp_root = os.path.join(out_dir, 'eval-raw'), os.path.join(out_dir, '.eval-tmp')
+    args.inventory = args.inventory or os.path.join(out_dir, "00-inventory.json")
     try:
-        os.makedirs(raw_dir, exist_ok=True)
-    except OSError as e:
-        print('evaluate.py: 输出目录写不进 %s（%s）' % (out_dir, e), file=sys.stderr)
+        os.makedirs(out_dir, exist_ok=True)
+        _assert_below(os.path.join(out_dir, "eval-raw"), out_dir)
+    except OSError as exc:
+        print("evaluate.py: 输出目录写不进 %s（%s）" % (out_dir, exc), file=sys.stderr)
         return 2
     try:
-        index = load_inventory(args.inventory)
-    except (OSError, ValueError) as e:
-        print('evaluate.py: 读 inventory 失败 %s（%s）' % (args.inventory, e), file=sys.stderr)
+        skills = load_inventory(args.inventory)
+    except (OSError, ValueError) as exc:
+        print("evaluate.py: 读 inventory 失败 %s（%s）" % (args.inventory, exc), file=sys.stderr)
         return 2
 
-    old_by_id = {}
-    cache_path = os.path.join(out_dir, '02-eval-results.json')
-    if os.path.isfile(cache_path):
+    selectors = _parse_selectors(args.skills)
+    if not selectors:
+        print("evaluate.py: --skills 解析后为空（未指定任何组件，不会启动评测）", file=sys.stderr)
+        return 2
+    resolved, problems = resolve_skill_selectors(skills, selectors)
+    total_budget = (
+        args.total_budget_usd
+        if args.total_budget_usd is not None
+        else args.max_cost_usd * max(1, len(resolved) or len(selectors))
+    )
+    errors = []
+    warnings = []
+    results = []
+    spent = 0.0
+    cost_verification = "complete"
+    out_path = os.path.join(
+        out_dir, "02-eval-results.dry-run.json" if args.dry_run else "02-eval-results.json"
+    )
+
+    if problems:
+        for problem in problems:
+            errors.append(structured_error(
+                problem["code"], "resolve", problem["message"], selector=problem.get("selector")
+            ))
+        document = build_document(
+            args, runtime_agent, backend, total_budget, spent, results, errors, warnings,
+            cost_verification,
+        )
         try:
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                old_by_id = {r.get('skill_id'): r for r in (json.load(f).get('results') or [])}
-        except (OSError, ValueError):
-            old_by_id = {}
-    cached = old_by_id if args.skip_cached else {}
+            write_json(out_path, document)
+        except OSError as exc:
+            print("evaluate.py: 写结果失败 %s（%s）" % (out_path, exc), file=sys.stderr)
+            return 2
+        print("evaluate: 解析失败，未启动任何付费进程 → %s" % out_path)
+        return 0
 
-    results, errors, warnings, n_cached, spent = [], [], [], 0, 0.0
-    # B2：--skills 分隔宽容（逗号/空白均可；不做位置参数，保持契约清晰）
-    ids = [x for x in re.split(r'[,\s]+', args.skills) if x]
-    total_budget = (args.total_budget_usd if args.total_budget_usd is not None
-                    else args.max_cost_usd * max(1, len(ids)))
-    for sid in ids:
-        if sid in cached and cache_valid(cached[sid], args.model):
-            c = dict(cached[sid])
-            c['cached'] = True
-            results.append(c)
-            n_cached += 1
-            warnings.append('%s: 命中缓存跳过（model=%s）' % (sid, c.get('model')))
+    if backend == "none":
+        for skill in resolved:
+            results.append(unsupported_result(
+                skill, args.model, args.judge_model, args.runs, runtime_agent
+            ))
+        warnings.append(
+            "%s: unsupported_runtime；无注册评测后端，未调用 Claude，内容价值未验证"
+            % runtime_agent
+        )
+        document = build_document(
+            args, runtime_agent, backend, total_budget, spent, results, errors, warnings,
+            cost_verification,
+        )
+        try:
+            write_json(out_path, document)
+        except OSError as exc:
+            print("evaluate.py: 写结果失败 %s（%s）" % (out_path, exc), file=sys.stderr)
+            return 2
+        print("evaluate: runtime=%s 不支持付费评测，$0 → %s" % (runtime_agent, out_path))
+        return 0
+
+    execution_model = args.model or "dry-run-unpinned"
+    plans = []
+    for skill in resolved:
+        cases, case_warnings = find_cases(out_dir, skill)
+        warnings.extend(case_warnings)
+        source_root = source_root_for(skill)
+        if not source_root:
+            result = base_result(skill, args.model, args.judge_model, None, None, args.runs)
+            message = "组件来源文件/目录不存在"
+            set_result_error(result, message)
+            results.append(result)
+            errors.append(structured_error("source_missing", "assemble", message, skill=skill))
             continue
-        entry = {'skill_id': sid, 'prescreen': dict(PRESCREEN), 'cases': [], 'delta': None,
-                 'verdict': 'inconclusive', 'evidence': '', 'cost_usd': None, 'model': 'unknown',
-                 'evaluated_at': now_iso(), 'runs': args.runs, 'duration_seconds': None, 'error': None}
-        results.append(entry)
-        remaining = round(total_budget - spent, 6)
-        if remaining <= 0:
-            fail(entry, errors, 'budget', '本次总预算已用完，未启动该 skill 的评测')
-            continue
-        skill = index.get(sid)
-        if skill is None:
-            fail(entry, errors, 'resolve', 'inventory 里找不到该 skill id（--inventory 对了吗）')
-            continue
-        cases, w = find_cases(out_dir, sid)
-        warnings.extend(w)
         if not cases:
-            fail(entry, errors, 'cases', 'case 库为空或不存在（%s）：请先按 references/'
-                 'case-authoring.md 生成 case 并过人审（skill 自带 evals/ 的也先入库），再重跑'
-                 % os.path.join(out_dir, 'cases', sid))
+            result = base_result(skill, args.model, args.judge_model, None, None, args.runs)
+            message = "case 库为空；请先按 references/case-authoring.md 生成并人审"
+            set_result_error(result, message)
+            results.append(result)
+            errors.append(structured_error("cases_missing", "cases", message, skill=skill))
             continue
-        pkg_dir = os.path.join(tmp_root, sanitize(sid) + '-pkg')
-        try:
-            assemble_pkg(pkg_dir, skill, cases)
-        except OSError as e:
-            fail(entry, errors, 'assemble', 'pkg 组装失败：%s' % e)
-            continue
-        raw_path = os.path.join(raw_dir, sanitize(sid) + '.json')
-        skill_budget = min(args.max_cost_usd, remaining)
-        print('[$ %s]（cwd=%s；本次剩余总预算 $%.2f）' % (
-            ' '.join(cli_command(args.runs, skill_budget, raw_path)), pkg_dir, remaining), flush=True)
-        if args.dry_run:
-            raw = fake_result(sid, [n for n, _ in cases], args.runs)
-            raw['costUsd'] = min(raw['costUsd'], skill_budget)
-            try:
-                with open(raw_path, 'w', encoding='utf-8') as f:
-                    json.dump(raw, f, ensure_ascii=False, indent=2)
-            except OSError as e:
-                fail(entry, errors, 'parse', 'dry-run 假结果写入失败：%s' % e)
-                continue
-        else:
-            ok, detail = run_cli(pkg_dir, args.runs, skill_budget, raw_path)
-            if not ok:
-                fail(entry, errors, 'cli', detail)
-                continue
-            try:
-                with open(raw_path, 'r', encoding='utf-8') as f:
-                    raw = json.load(f)
-            except (OSError, ValueError) as e:
-                fail(entry, errors, 'parse', '结果 JSON 读取/解析失败：%s' % e)
-                continue
-        entry.update(parse_result(raw, raw_path))
-        spent += entry['cost_usd'] or 0
-        if not args.keep_temp:
-            shutil.rmtree(pkg_dir, ignore_errors=True)
-        print('eval %s: cases=%d delta=%s verdict=%s cost=%s%s' % (sid, len(cases),
-              entry['delta'], entry['verdict'], entry['cost_usd'],
-              '（dry-run 假数据）' if args.dry_run else ''), flush=True)
+        plans.append({"skill": skill, "cases": cases, "source_root": source_root})
 
-    models = {(r.get('model') or 'unknown') for r in results if not r.get('error')}
-    top_model = args.model if args.model != 'unknown' else models.pop() if len(models) == 1 else 'unknown'
-    if not args.dry_run:  # 分批跑时结转本次未涉及 skill 的旧结果（02 是累积账本，缓存的前提）
-        results = [r for s, r in old_by_id.items() if s not in ids] + results
-    out_path = os.path.join(out_dir, '02-eval-results.dry-run.json' if args.dry_run
-                            else '02-eval-results.json')
-    clean = [{k: v for k, v in r.items() if k != 'cached'} for r in results]  # cached 标志只描述本次
-    doc = {'evaluated_at': now_iso(), 'model': top_model,
-           'budget_usd': args.max_cost_usd, 'total_budget_usd': total_budget,
-           'total_cost_usd': round(spent, 2),
-           'cost_note': COST_NOTE, 'runs': args.runs, 'dry_run': args.dry_run,
-           'results': clean, 'errors': errors, 'warnings': warnings}
+    capability = {}
+    if args.capability_cache:
+        try:
+            capability = load_capability_cache(args.capability_cache)
+        except (OSError, ValueError) as exc:
+            warnings.append("capability cache 无效，忽略：%s" % exc)
+    supports = capability.get("supports") or {}
+    if supports.get("plugin_eval") is False:
+        message = "capability cache 明确标记 plugin_eval=false；未启动付费进程"
+        for plan in plans:
+            result = base_result(
+                plan["skill"], args.model, args.judge_model,
+                capability.get("claude_version"), None, args.runs,
+            )
+            set_result_error(result, message)
+            results.append(result)
+            errors.append(structured_error("eval_capability_unavailable", "eval", message, skill=plan["skill"]))
+        plans = []
+
+    if args.dry_run:
+        claude_version = "dry-run"
+    else:
+        claude_version = capability.get("claude_version")
+        if not claude_version and plans:
+            claude_version, version_error = query_claude_version()
+            if version_error:
+                message = "无法取得 Claude Code 版本，拒绝启动不可可靠缓存的付费评测：%s" % version_error
+                for plan in plans:
+                    result = base_result(plan["skill"], args.model, args.judge_model, None, None, args.runs)
+                    set_result_error(result, message)
+                    results.append(result)
+                    errors.append(structured_error("claude_version_unavailable", "eval", message, skill=plan["skill"]))
+                plans = []
+
+    prepared = []
+    for plan in plans:
+        try:
+            fingerprint = compute_fingerprint(
+                skill_instance_id=plan["skill"].get("instance_id"),
+                source_root=plan["source_root"],
+                cases=plan["cases"],
+                runs=args.runs,
+                execution_model=execution_model,
+                judge_model=args.judge_model,
+                ablation_mode=args.ablation,
+                claude_version=claude_version,
+            )
+        except OSError as exc:
+            result = base_result(plan["skill"], args.model, args.judge_model, claude_version, None, args.runs)
+            message = "fingerprint 读取失败：%s" % exc
+            set_result_error(result, message)
+            results.append(result)
+            errors.append(structured_error("fingerprint_failed", "cache", message, skill=plan["skill"]))
+            continue
+        plan["fingerprint"] = fingerprint
+        plan["raw_parent"] = raw_parent(
+            out_dir, plan["skill"].get("instance_id"), execution_model, fingerprint
+        )
+        prepared.append(plan)
+
+    stop_paid_runs = False
+    stop_reason = None
+    stop_due_unknown_cost = False
+    cached_count = 0
+    for plan in prepared:
+        skill = plan["skill"]
+        fingerprint = plan["fingerprint"]
+        parent = plan["raw_parent"]
+        cache_file = cache_path_for(parent)
+        if args.skip_cached and not args.dry_run:
+            cached = load_exact_cache(
+                cache_file,
+                fingerprint,
+                skill.get("instance_id"),
+                args.model,
+                claude_version,
+            )
+            if cached is not None:
+                results.append(cached)
+                cached_count += 1
+                warnings.append("%s: 精确 fingerprint 缓存命中，本次成本 $0" % skill.get("instance_id"))
+                continue
+
+        if stop_paid_runs:
+            result = base_result(
+                skill, args.model, args.judge_model, claude_version, fingerprint, args.runs
+            )
+            status = "error" if stop_due_unknown_cost else "partial"
+            set_result_error(result, stop_reason, status=status, partial=(status == "partial"))
+            results.append(result)
+            errors.append(structured_error("paid_runs_stopped", "budget", stop_reason, skill=skill))
+            continue
+
+        remaining = total_budget - spent
+        if not args.dry_run and remaining <= 0:
+            message = "本次总预算启动上限已用完，未启动该组件"
+            result = base_result(
+                skill, args.model, args.judge_model, claude_version, fingerprint, args.runs
+            )
+            set_result_error(result, message, status="partial", partial=True)
+            results.append(result)
+            errors.append(structured_error("budget_launch_limit_reached", "budget", message, skill=skill))
+            continue
+
+        pkg_dir = os.path.join(
+            out_dir,
+            ".eval-tmp",
+            safe_component(skill.get("instance_id")),
+            fingerprint,
+            "pkg",
+        )
+        try:
+            assemble_pkg(pkg_dir, out_dir, skill, plan["cases"])
+        except OSError as exc:
+            result = base_result(
+                skill, args.model, args.judge_model, claude_version, fingerprint, args.runs
+            )
+            message = "临时 plugin package 组装失败：%s" % exc
+            set_result_error(result, message)
+            results.append(result)
+            errors.append(structured_error("package_assembly_failed", "assemble", message, skill=skill))
+            continue
+
+        raw_path = next_attempt_path(parent)
+        result = base_result(
+            skill, args.model, args.judge_model, claude_version, fingerprint, args.runs
+        )
+        result["raw_result_path"] = raw_path
+        skill_budget = args.max_cost_usd if args.dry_run else min(args.max_cost_usd, remaining)
+        command = cli_command(
+            args.runs,
+            skill_budget,
+            raw_path,
+            execution_model,
+            args.judge_model,
+            args.ablation,
+        )
+        print(
+            "[$ %s]（cwd=%s；剩余启动预算 $%.6f）"
+            % (" ".join(command), pkg_dir, max(0.0, remaining)),
+            flush=True,
+        )
+        try:
+            if args.dry_run:
+                raw = fake_result(
+                    [name for name, _ in plan["cases"]],
+                    execution_model,
+                    args.judge_model,
+                    args.ablation,
+                )
+                write_json(raw_path, raw)
+                parsed = parse_raw_result(
+                    raw,
+                    [name for name, _ in plan["cases"]],
+                    execution_model,
+                    args.ablation,
+                    raw_path,
+                    requested_judge_model=args.judge_model,
+                )
+                result.update(parsed)
+                result.update({
+                    "status": "dry_run",
+                    "requested_model": args.model,
+                    "verdict": "inconclusive",
+                    "evidence": "dry-run 假 raw，仅验证编排与 schema，不代表内容价值；raw：%s" % raw_path,
+                    "cost_usd": 0.0,
+                    "cost_usd_this_run": 0.0,
+                    "cacheable": False,
+                    "partial": False,
+                    "partial_reason": None,
+                })
+                results.append(result)
+                continue
+
+            timeout_seconds = 60 + args.runs * 300
+            process = run_cli(pkg_dir, command, timeout_seconds)
+            if not process["started"]:
+                message = "Claude CLI 启动失败；未读取任何旧 raw：%s" % process["launch_error"]
+                set_result_error(result, message)
+                result["raw_result_path"] = None
+                results.append(result)
+                errors.append(structured_error("cli_start_failed", "eval", message, skill=skill))
+                stop_paid_runs = True
+                stop_reason = "前一 CLI 无法启动，已停止后续付费项"
+                stop_due_unknown_cost = True
+                continue
+
+            raw = None
+            raw_error = None
+            try:
+                with open(raw_path, "r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+            except (OSError, ValueError) as exc:
+                raw_error = "%s: %s" % (exc.__class__.__name__, exc)
+            if not isinstance(raw, dict):
+                message = "CLI 已启动但没有可解析 raw JSON，成本无法验证，fail closed：%s" % raw_error
+                set_result_error(result, message, cost_unknown=True)
+                results.append(result)
+                errors.append(structured_error("raw_or_cost_unavailable", "eval", message, skill=skill))
+                cost_verification = "incomplete"
+                stop_paid_runs = True
+                stop_reason = "前一已启动评测的成本无法验证，已停止后续付费项"
+                stop_due_unknown_cost = True
+                continue
+
+            forced_reason = None
+            if process["timed_out"]:
+                forced_reason = "Claude CLI 超时；即使 raw 可读也只能视为 partial"
+            elif process["returncode"] not in (0, 1):
+                forced_reason = "Claude CLI exit %s；raw 只能视为 partial" % process["returncode"]
+            parsed = parse_raw_result(
+                raw,
+                [name for name, _ in plan["cases"]],
+                args.model,
+                args.ablation,
+                raw_path,
+                forced_partial_reason=forced_reason,
+                requested_judge_model=args.judge_model,
+            )
+            result.update(parsed)
+            result["cost_usd_this_run"] = parsed.get("cost_usd")
+            if parsed.get("cost_usd") is None:
+                message = "CLI 已启动但 costUsd 不可信，fail closed"
+                set_result_error(result, message, cost_unknown=True)
+                results.append(result)
+                errors.append(structured_error("cost_unverified", "budget", message, skill=skill))
+                cost_verification = "incomplete"
+                stop_paid_runs = True
+                stop_reason = "前一已启动评测的成本无法验证，已停止后续付费项"
+                stop_due_unknown_cost = True
+                continue
+
+            spent += float(parsed["cost_usd"])
+            results.append(result)
+            if result["status"] == "complete" and result["cacheable"]:
+                try:
+                    write_exact_cache(cache_file, result)
+                except OSError as exc:
+                    warnings.append("%s: cache 写入失败（不影响本次结果）：%s" % (skill.get("instance_id"), exc))
+            else:
+                errors.append(structured_error(
+                    "eval_inconclusive",
+                    "eval",
+                    result.get("partial_reason") or "eval 未满足完整判分门槛",
+                    skill=skill,
+                ))
+                stop_paid_runs = True
+                stop_reason = "前一评测为 partial/inconclusive，已停止后续付费项"
+                stop_due_unknown_cost = False
+        finally:
+            if not args.keep_temp:
+                shutil.rmtree(pkg_dir, ignore_errors=True)
+
+    document = build_document(
+        args,
+        runtime_agent,
+        backend,
+        total_budget,
+        spent,
+        results,
+        errors,
+        warnings,
+        cost_verification,
+    )
     try:
-        with open(out_path, 'w', encoding='utf-8') as f:
-            json.dump(doc, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        print('evaluate.py: 写结果失败 %s（%s）' % (out_path, e), file=sys.stderr)
+        write_json(out_path, document)
+    except OSError as exc:
+        print("evaluate.py: 写结果失败 %s（%s）" % (out_path, exc), file=sys.stderr)
         return 2
-    print('evaluate%s: %d skills（错误 %d，缓存跳过 %d）→ %s'
-          % ('（dry-run，假数据）' if args.dry_run else '', len(results), len(errors), n_cached, out_path))
+    print(
+        "evaluate%s: %d results（错误/未验证 %d，缓存 %d，本次成本 $%.6f）→ %s"
+        % ("（dry-run）" if args.dry_run else "", len(results), len(errors), cached_count, spent, out_path)
+    )
     if args.json:
-        print(json.dumps({'ok': not errors, 'out': out_path, 'skills': len(results), 'errors': len(errors),
-                          'cached': n_cached, 'dry_run': args.dry_run, 'total_cost_usd': round(spent, 2)},
-                         ensure_ascii=False))
+        print(json.dumps({
+            "ok": document["status"] in {"complete", "dry_run", "unsupported_runtime"},
+            "out": out_path,
+            "status": document["status"],
+            "results": len(results),
+            "errors": len(errors),
+            "cached": cached_count,
+            "dry_run": args.dry_run,
+            "runtime_agent": runtime_agent,
+            "total_cost_usd": round(spent, 6),
+        }, ensure_ascii=False))
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
