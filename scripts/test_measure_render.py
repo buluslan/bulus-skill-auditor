@@ -440,7 +440,8 @@ def test_render_v2(root, inventory, metrics, metrics_path):
     assert text == text_b, "same inputs must render byte-identical reports regardless of output path"
 
     assert "按 Agent 分账" in text
-    assert "listing demand" in text and "injected upper bound" in text and "potential overflow" in text
+    assert "简介总需求" in text and "预算内可注入" in text and "超出预算" in text
+    assert "名词速查" in text and "每次会话都挂着的简介" in text, "报告必须自带名词速查（非技术读者）"
     assert "跨 Agent 维护副本" in text and "不代表单次会话可节省" in text
     assert "custom-agent" in text and "无可比 token 上限" in text
     assert "总预算（启动上限）：$3.00" in text

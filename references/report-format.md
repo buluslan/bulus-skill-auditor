@@ -3,6 +3,33 @@
 > 何时读：缝合最终报告时。原则：**骨架字段（表格/数字/聚合）由脚本渲染，重跑等价；判断内容（诊断叙述/建议）走注入位，随 json 留档**——两层不混写。
 > v2 起，骨架的一切聚合都按 Agent 分账、以 canonical `instance_id` 为唯一主键；本文件结构与 `render_report.py` 的实际输出一一对应。
 
+## 读者预设与说话方式（注入层硬约束）
+
+**读者是谁**：装了一堆 skill 的普通使用者。会装、会用、会说"帮我审计一下 skills"，但不懂 token 计量、instance_id、JSON、schema。报告是写给这个人看的，不是写给工程师同行看的。
+
+**注入段的成文规矩**：
+
+1. **术语必须翻译**：注入文本里出现任何术语，第一次出现时跟一个括注人话。对照表（骨架表头已内置同名速查，注入层保持同一套说法）：
+
+   | 术语 | 对用户说成 |
+   |---|---|
+   | 常驻 / listing / always | 「常驻」= 每次会话都挂着的简介 |
+   | 触发 / trigger / body | 「触发」= 被调用时才进对话的正文 |
+   | refs / 参考文件 | 按需翻的资料库 |
+   | token | AI 的字数计量（1 token 约半个到一个汉字） |
+   | confirmed / inferred / excluded | 已确认 / 推断 / 排除（证据等级） |
+   | instance_id | 实例 ID（同名的两个副本各有一个） |
+   | listing 预算 / budget | 名片区容量 |
+   | potential overflow | 装不下的部分（后面的简介可能根本没被看到） |
+   | 静默截断 | 系统不提示、默默把超出的简介丢掉 |
+   | discovery=complete | 扫描状态=完整 |
+
+2. **数字必须跟后果**：不孤立报数字，每个关键数字后面跟一句"这意味着什么"。❌「potential overflow 6,885」→ ✅「有 6,885 token 的简介装不进名片区——这部分简介等于白写了，AI 根本看不到」。
+3. **建议必须可执行**：处置建议写给不做工程的人：说清楚"动哪个（用名字，不是实例 ID）、怎么动（禁用/改瘦/删掉的点击路径或一句话操作）、动了会怎样"。
+4. **自检**：注入段写完通读一遍——把读者想象成不懂任何英文缩写的人，任何一格需要先解释才能懂的表述，就地改写成速查表里的说法。
+
+骨架表格的列头与枚举值已由脚本渲染成中文；注入文本不得把术语改回英文缩写风格。
+
 ## 产物清单（一次审计最多产出四个文件）
 
 | 文件 | 内容 | 生成方式 |
@@ -17,39 +44,39 @@
 # Skill 审计报告 · <日期>（取 00 的 generated_at，保证可复现）
 
 > 口径声明（脚本固定渲染，Agent 不得改写）：
-> - 覆盖结论：只有 discovery=complete 的 Agent 才写「当前全量」；否则写「已确认清单 + 推断候选」
-> - 按 Agent 分账：不同 Agent 的 listing demand 绝不相加成一张"每次会话账单"
-> - token 为 o200k_local 近似；always 只计 description，不含运行时可能附加的 name/格式开销
-> - active+listing confirmed 才进 confirmed 账单；unknown/estimated 与 excluded 分列
-> - 未知 usage 保持未知，不按 0 激活处理；跨 Agent 副本只表示维护关系
+> - 覆盖结论：只有扫描状态=完整的 Agent 才写「当前全量」；否则写「已确认清单 + 推断候选」
+> - 按 Agent 分账：不同 Agent 的账目绝不加成一张「每次会话总账单」
+> - 名词速查：「常驻」=每次会话都挂着的简介；「触发」=被调用时才进对话的正文；「参考文件」=按需加载的资料；token = AI 的字数计量（1 token 约半个到一个汉字）；confirmed（已确认）/inferred（推断）/excluded（排除）= 证据等级
+> - token 为 o200k 近似；常驻只计简介文本，不含运行时可能附加的名字/格式开销
+> - 只有运行时确认在用的组件才进「已确认」账单；推断/未知与排除项分开列
+> - 使用次数未知就写未知，不当成 0；跨 Agent 的同款只算维护关系（改一处要记得另一处）
 > - 深度评测（若跑）：总预算（启动上限）＋本次实际新增花费＋实际模型汇总
 
 ## 一、总览（按 Agent 分账）
-| Agent | discovery | confirmed active | confirmed token | inferred/unknown | inferred token |
-|       | excluded | excluded token | listing demand | injected upper bound | potential overflow |
-<!-- 每行预算口径以 HTML 注释附带：budget basis / 含 inferred 的潜在需求 / 含 inferred 的潜在溢出 -->
+| Agent | 扫描状态 | 确认在用 | 常驻token（确认） | 推断/未知 | 推断token | 已排除 | 排除token | 简介总需求 | 预算内可注入 | 超出预算 |
+<!-- 每行预算口径以表下 bullet 附带：预算依据 / 含 inferred 的潜在需求 / 含 inferred 的潜在溢出 -->
 
-## 二、真账单（canonical instance 全量明细）
-| instance | runtime | agent | type | active | listing/trigger | 常驻token | 触发token | refs | usage | priority | 标记 |
+## 二、真账单（全部组件明细）
+| 实例ID | 名字 | Agent | 类型 | 状态 | 计量口径 | 常驻token | 触发token | 参考文件token | 30天使用 | 优先分 | 标记 |
 
 ## 三、诊断事实（不替用户执行处置）
-### 使用覆盖（按 Agent：status/sessions/unreadable/parse errors/undated/matched activations/limitations）
+### 使用覆盖（按 Agent：扫描状态/会话数/读不出的文件/解析错误/无日期事件/匹配到的调用/限制说明）
 ### 重复候选（跨 Agent 维护副本 N 对 / 同 Agent 重复候选 N 对，均人工确认级）
 ### 结构问题（structure_flags 计数 + 健康候选数量）
-<!-- INJECT: Agent 按 audit-rubric 补充诊断判断 -->
+<!-- INJECT: Agent 按 audit-rubric 补充诊断判断（按「读者预设与说话方式」说人话） -->
 
 ## 四、高嫌疑名单（每个 Agent 独立归一，跨 Agent 分数不可直接比较）
-| # | instance | runtime | score | Agent 内归一理由 |
+| # | 实例ID | 名字 | 分数 | 排序理由（Agent内归一） |
 
 ## 五、处置建议（注入位）
-<!-- INJECT: 按 refactor-playbook 写信号、预计收益、风险前提和人工确认框 -->
+<!-- INJECT: 按 refactor-playbook 写信号、预计收益、风险前提和人工确认框；动作写给非技术用户 -->
 
 ## 六、深度评测结果（只消费官方聚合与显式状态）
-<!-- 模型行：实际模型汇总 / 请求执行模型 / judge / runtime+backend / 顶层状态
+<!-- 模型行：实际模型汇总 / 请求执行模型 / 评分模型 / runtime+backend / 顶层状态
      预算行：总预算（启动上限）+ 本次实际新增花费 + cost_scope
      固定披露：concurrency=1 时一个在途 run 仍可能小幅突破预算
      分桶行：已验证 N / 内容价值未验证 N / 各 status 计数
-     表行：instance | runtime | 实际模型 | 请求模型 | judge | status | partial/cache | cases | 官方Δ | 判定 | 本次成本 -->
+     表行：实例ID | 名字 | 实际模型 | 请求模型 | 评分模型 | 状态 | 缓存 | 完整题数 | 分差 | 判定 | 本次花费 -->
 
 ## 七、附录：issues 与复核入口
 <!-- structured issues 计数 + 复核命令表（jq 单行，按 Agent 分组口径） -->
@@ -84,9 +111,9 @@
 
 ```markdown
 # 我的 Skill 清单 · <日期>（<N> 个实例）
-> 按 Agent 分组；active confirmed、inferred/unknown、excluded 不混写。
+> 按 Agent 分组；已确认、推断/未知、已排除不混写。
 
 ## <agent>（<n> 个实例）
-- <runtime_name> — <instance_id> / <component_type> / <accounting_status> / <usage 口径>
-<!-- INJECT: 仅补场景建议，不改脚本生成的实例与状态 -->
+- <runtime_name>（<component_type>，<accounting_status 中文>，30 天用了 <usage> 次）
+<!-- INJECT: 仅补场景建议（什么时候会用到它），不改脚本生成的实例与状态 -->
 ```

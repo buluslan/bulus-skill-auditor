@@ -25,6 +25,20 @@ FLAG_LABEL = {
     "heavy_body_no_refs": "超重无refs",
     "skeleton": "骨架",
 }
+# 报告面向普通使用者：枚举值渲染成中文，机器字段仍可在 JSON 里对账
+_DISCOVERY_LABEL = {
+    "complete": "完整",
+    "partial": "部分",
+    "unavailable": "不可用",
+}
+_EVIDENCE_LABEL = {
+    "active": "在用",
+    "unknown": "未知",
+    "confirmed": "已确认",
+    "inferred": "推断",
+    "excluded": "排除",
+    "estimated": "估算",
+}
 VERDICT_LABEL = {
     "suspected_native_coverage": "疑似模型已原生覆盖（须人工复核）",
     "valuable": "有价值（保留）",
@@ -443,7 +457,7 @@ def _render_eval(lines, eval_document, skills, legacy_eval):
             " / ".join("%s %d" % (key, statuses[key]) for key in sorted(statuses)) or "无结果",
         ),
         "",
-        "| instance | runtime | actual model | requested model | judge | status | partial/cache | cases | 官方 Δ | 判定 | 本次成本 |",
+        "| 实例ID | 名字 | 实际模型 | 请求模型 | 评分模型 | 状态 | 缓存 | 完整题数 | 分差 | 判定 | 本次花费 |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for instance_id, skill, result in rows:
@@ -484,11 +498,12 @@ def render(metrics, usage_src, usage, eval_document, inject, summary, legacy_met
     scope_label = "当前全量" if discovery_complete else "已确认清单 + 推断候选"
     lines += [
         "> 口径声明（脚本固定渲染）：",
-        "> - 覆盖结论：%s；只有 discovery=complete 的 Agent 才能称为当前全量" % scope_label,
-        "> - 按 Agent 分账：不同 Agent 的 listing demand 绝不相加成一张“每次会话账单”",
-        "> - token 为 o200k_local 近似；always 只计 description，不含运行时可能附加的 name/格式开销",
-        "> - active+listing confirmed 才进 confirmed 账单；unknown/estimated 与 excluded 分列",
-        "> - 未知 usage 保持未知，不按 0 激活处理；跨 Agent 副本只表示维护关系",
+        "> - 覆盖结论：%s；只有扫描状态=完整的 Agent 才能称为当前全量" % scope_label,
+        "> - 按 Agent 分账：不同 Agent 的账目绝不加成一张「每次会话总账单」",
+        "> - 名词速查：「常驻」=每次会话都挂着的简介；「触发」=被调用时才进对话的正文；「参考文件」=按需加载的资料；token = AI 的字数计量（1 token 约半个到一个汉字）；confirmed（已确认）/inferred（推断）/excluded（排除）= 证据等级",
+        "> - token 为 o200k 近似；常驻只计简介文本，不含运行时可能附加的名字/格式开销",
+        "> - 只有运行时确认在用的组件才进「已确认」账单；推断/未知与排除项分开列",
+        "> - 使用次数未知就写未知，不当成 0；跨 Agent 的同款只算维护关系（改一处要记得另一处）",
     ]
     if eval_document:
         lines += [
@@ -503,7 +518,7 @@ def render(metrics, usage_src, usage, eval_document, inject, summary, legacy_met
 
     lines += [
         "## 一、总览（按 Agent 分账）", "",
-        "| Agent | discovery | confirmed active | confirmed token | inferred/unknown | inferred token | excluded | excluded token | listing demand | injected upper bound | potential overflow |",
+        "| Agent | 扫描状态 | 确认在用 | 常驻token（确认） | 推断/未知 | 推断token | 已排除 | 排除token | 简介总需求 | 预算内可注入 | 超出预算 |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     budget_notes = []
@@ -513,10 +528,10 @@ def render(metrics, usage_src, usage, eval_document, inject, summary, legacy_met
             injected = "无可比 token 上限"
             overflow = "无可比 token 上限"
         else:
-            injected = "%s / budget %s" % (fmt(row["injected_upper_bound"]), fmt(row["budget"]))
+            injected = "%s / 预算 %s" % (fmt(row["injected_upper_bound"]), fmt(row["budget"]))
             overflow = fmt(row["potential_overflow"])
         values = [
-            agent, discovery_statuses.get(agent, "unavailable"),
+            agent, _DISCOVERY_LABEL.get(discovery_statuses.get(agent), discovery_statuses.get(agent, "不可用")),
             row["confirmed_components"], row["confirmed_tokens"],
             row["inferred_components"], row["inferred_tokens"],
             row["excluded_components"], row["excluded_tokens"],
@@ -530,16 +545,16 @@ def render(metrics, usage_src, usage, eval_document, inject, summary, legacy_met
             ))
     lines += [
         "",
-        "说明：listing demand 是 confirmed active 的已确认需求；injected upper bound 是已知预算下最多可注入的 confirmed token；"
-        "potential overflow 是 confirmed demand 超出该上限的部分。没有同单位、同口径上限的 Agent 不做猜测。",
+        "说明：「简介总需求」是确认在用组件的常驻简介合计；「预算内可注入」是已知预算下名片区最多放得下的部分；"
+        "「超出预算」是需求超出预算的部分——超出即存在静默截断风险（后面的简介可能根本没被看到）。没有同单位、同口径上限的 Agent 不做猜测。",
     ]
     for note in budget_notes:
         lines.append("- " + note)
     lines += ["", ""]
 
     lines += [
-        "## 二、真账单（canonical instance 全量明细）", "",
-        "| instance | runtime | agent | type | active | listing/trigger | 常驻token | 触发token | refs | usage | priority | 标记 |",
+        "## 二、真账单（全部组件明细）", "",
+        "| 实例ID | 名字 | Agent | 类型 | 状态 | 计量口径 | 常驻token | 触发token | 参考文件token | 30天使用 | 优先分 | 标记 |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     status_order = {"confirmed": 0, "inferred": 1, "excluded": 2}
@@ -557,9 +572,13 @@ def render(metrics, usage_src, usage, eval_document, inject, summary, legacy_met
         flags = "+".join(FLAG_LABEL.get(flag, flag) for flag in (skill.get("structure_flags") or [])) or "—"
         values = [
             skill["instance_id"], skill.get("runtime_name"), skill.get("agent"), skill.get("component_type"),
-            skill.get("active_state") or "unknown",
-            "%s/%s (%s)" % (accounting.get("listing", "estimated"), accounting.get("trigger", "estimated"),
-                             (skill.get("tokens") or {}).get("accounting_status", "inferred")),
+            _EVIDENCE_LABEL.get(skill.get("active_state"), skill.get("active_state") or "未知"),
+            "%s/%s（%s）" % (
+                _EVIDENCE_LABEL.get(accounting.get("listing"), accounting.get("listing", "估算")),
+                _EVIDENCE_LABEL.get(accounting.get("trigger"), accounting.get("trigger", "估算")),
+                _EVIDENCE_LABEL.get((skill.get("tokens") or {}).get("accounting_status"),
+                                    (skill.get("tokens") or {}).get("accounting_status", "推断")),
+            ),
             fmt(tok(skill, "always")), fmt(tok(skill, "on_trigger")), fmt(tok(skill, "refs_total")),
             usage_text, priority_text, flags,
         ]
@@ -569,14 +588,15 @@ def render(metrics, usage_src, usage, eval_document, inject, summary, legacy_met
     lines += ["## 三、诊断事实（不替用户执行处置）", "", "### 使用覆盖"]
     raw_coverage = ((usage or {}).get("coverage") or {}).get("by_agent") if isinstance((usage or {}).get("coverage"), dict) else {}
     lines += [
-        "| Agent | status | sessions | unreadable | parse errors | undated | matched activations | limitations |",
+        "| Agent | 扫描状态 | 会话数 | 读不出的文件 | 解析错误 | 无日期事件 | 匹配到的调用 | 限制说明 |",
         "|---|---|---|---|---|---|---|---|",
     ]
     for agent in agent_names:
         detail = raw_coverage.get(agent) if isinstance(raw_coverage, dict) else None
         detail = detail if isinstance(detail, dict) else {}
         values = [
-            agent, summary["coverage"].get(agent, "unavailable"), detail.get("sessions_scanned"),
+            agent, _DISCOVERY_LABEL.get(summary["coverage"].get(agent), summary["coverage"].get(agent, "不可用")),
+            detail.get("sessions_scanned"),
             detail.get("files_unreadable"), detail.get("parse_errors"), detail.get("undated_events"),
             detail.get("matched_activations"), "；".join(detail.get("limitations") or []) or "—",
         ]
@@ -633,7 +653,7 @@ def render(metrics, usage_src, usage, eval_document, inject, summary, legacy_met
     for agent in agent_names:
         candidates = summary["priorities"].get(agent) or []
         lines += ["### %s（%d 个可排序组件）" % (safe_text(agent), len(candidates)), "",
-                  "| # | instance | runtime | score | Agent 内归一理由 |", "|---|---|---|---|---|"]
+                  "| # | 实例ID | 名字 | 分数 | 排序理由（Agent内归一） |", "|---|---|---|---|---|"]
         for index, skill in enumerate(candidates[:15], 1):
             priority = skill["priority"]
             values = [index, skill["instance_id"], skill.get("runtime_name"), priority.get("score"),

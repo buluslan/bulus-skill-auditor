@@ -12,7 +12,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-0.2.0-black.svg)]()
+[![Version](https://img.shields.io/badge/version-0.2.1-black.svg)]()
 
 **按 Agent 三笔 Token 估算 · 四类诊断 · 对比评测 · 改造优先于删除 · 跨 Agent**
 
@@ -57,39 +57,51 @@ skill 体检大师（bulus-skill-auditor）是由 **buluslan（公众号：新�
 
 对比评测只有在原始结果完整、两臂可比较、模型明确且没有跳过付费评分时，才会给出内容价值结论。部分结果、运行错误、未知 schema 或模型不一致会保留证据，但状态只能是“无结论”或“内容价值未验证”。
 
-## 📊 案例展示（真实机器实测）
+## 📊 用了之后是什么效果（真实机器实测）
 
-下面是一台日常开发机上的真实审计结果（2026-09-23，已脱敏）：Claude Code 与 Codex 两个 Agent、共 352 个组件，三条脚本跑完约 4 秒。
+先说背景：AI 每次开新对话，都会先把你装的所有 skill 的「名片」（名字 + 一句话简介）过一遍，才知道该叫谁来干活。这片名片区有容量上限——Claude Code 大约 2,000 token（token 是 AI 的字数计量单位，1 token 约半个到一个汉字）。
 
-**扫出来的核心事实：**
+**名片装不下会怎样？系统不会报错，只会默默把后面的丢掉。** 也就是说：装太多 skill，排在后面的 skill 简介等于白写了，AI 根本不知道它存在。
 
-- **简介列表超载 4.4 倍（静默截断正在发生）**：Claude Code 当前 140 个组件的常驻简介合计 8,885 token，而 listing 预算约 2,000 token——简介列表装不下，超出部分被静默截断，等于一部分简介白写了。
-- **Codex 侧 212 个组件、15,201 token**：Codex 没有公开可比的 token 上限，报告如实标注“无可比上限”，不套用 Claude 的预算去吓人。
-- **30 天窗口零激活：Claude Code 123 个（87.9%）、Codex 181 个（85.4%）**——绝大多数组件装了没在用，每一条都是“改瘦 / 停用 / 保留”的待决策项。
-- **跨 Agent 重复副本 1,472 对**：同一个 skill 在两个 Agent 各装一份。报告只标“维护副本”，不宣称能省单次会话 token。
-- **超重组件 103 个**：正文全堆在 SKILL.md 里，触发时整段注入。最重的一个触发正文 32,310 token，还有一个的参考文件高达 320,181 token。
+下面是一台真实开发机的体检结果（2026-09-23，已脱敏）：装了 Claude Code 和 Codex 两个 AI 工具、共 352 个 skill 组件，跑完只用了 4 秒。扫出来五件事：
 
-**报告总览长这样（按 Agent 分账，绝不混成一张账单）：**
+**1️⃣ 四分之三的名片是白写的。**
+Claude Code 里 140 张名片要占 8,885 token 的地方，但名片区只有约 2,000——**四分之三的简介根本挤不进去，被默默丢掉了**。你可能精心给每个 skill 写了介绍，但 AI 压根没看到。
 
-| Agent | discovery | confirmed active | confirmed token | listing demand | injected upper bound | potential overflow |
-|---|---|---|---|---|---|---|
-| claude-code | complete | 140 | 8,885 | 8,885 | 2,000 / budget 2,000 | 6,885 |
-| codex | complete | 212 | 15,201 | 15,201 | 无可比 token 上限 | 无可比 token 上限 |
+**2️⃣ 近九成装了就没动过。**
+过去 30 天：Claude Code 的 140 个里有 123 个一次都没被调用（87.9%）；Codex 的 212 个里有 181 个（85.4%）。它们不占对话空间的名额，但每一个都值得问一句：还留吗？
 
-**单个组件的三笔账长这样（节选）：**
+**3️⃣ 同一个工具装了两份。**
+1,472 对「两个 AI 工具里装了同一个 skill」。这不会花双份的钱，但改了其中一份、忘了另一份，两边就会悄悄不一样。
 
-| runtime | 常驻 token | 触发 token | refs token | 30 天使用 | 标记 |
+**4️⃣ 有的 skill 一被叫醒就塞爆对话。**
+最重的一个，每次被调用就往对话里塞 3.2 万 token 的说明书——相当于每次都先读一本 60 页的手册再干活。还有个 skill 的随身资料库高达 32 万 token。
+
+**5️⃣ 真正常用的其实就几个。**
+比如 `lark-doc` 30 天用了 13 次——这种才是真刚需，重点保护。体检报告会帮你把这极少数「真在用的」和一大片「装了没动的」清楚分开。
+
+**报告的总览长这样（每个 AI 工具各算各的，绝不混成一笔账）：**
+
+| 装在哪 | 扫描状态 | 确认在用 | 简介总需求 | 名片区容量 | 装不下的部分 |
 |---|---|---|---|---|---|
-| skill-production-factory | 362 | 3,068 | 6,172 | 2 次 | — |
-| lark-sheets | 292 | 7,837 | **116,513** | 0 次 | — |
-| lark-slides | 151 | 7,598 | **320,181** | 0 次 | — |
-| design-review | 33 | **32,310** | 0 | 0 次 | 超重无 refs |
-| lark-doc | 120 | 951 | 49,452 | 13 次 | — |
-| frontend-design | 74 | 767 | 0 | 2 次 | 骨架 |
+| Claude Code | 完整 | 140 个 | 8,885 | 约 2,000 | **6,885** |
+| Codex | 完整 | 212 个 | 15,201 | 无公开上限，不乱估 | 不乱估 |
 
-> 同一份数据里能看到完全不同的形态：`lark-doc` 高频在用（13 次）是保留项；`lark-slides` 零使用 + 32 万 token 参考文件是改瘦首选项；`design-review` 触发正文 3.2 万 token 是拆分候选；`frontend-design` 正文只剩骨架是内容缺失信号。
+**每个 skill 的三笔账长这样（节选）：**
 
-完整 500 行报告（含使用覆盖、重复候选、高嫌疑排序、复核命令）见 **[docs/example-report.md](docs/example-report.md)**——它本身就是用仓库里的 `redact_report.py` 生成的脱敏副本，本机路径全部替换为 `<local-path>`，可以直接对照检验脱敏效果。
+| skill 名字 | 每次都挂着 | 一用就塞进来 | 随身资料库 | 30天用了几次 |
+|---|---|---|---|---|
+| skill-production-factory | 362 | 3,068 | 6,172 | 2 次 |
+| lark-sheets | 292 | 7,837 | **116,513** | 0 次 |
+| lark-doc | 120 | 951 | 49,452 | **13 次** |
+| design-review | 33 | **32,310** | 0 | 0 次 |
+| frontend-design | 74 | 767 | 0 | 2 次 |
+
+同一张表能看出完全不同的处境：`lark-doc` 高频在用（13 次）是重点保留；`lark-sheets` 零使用 + 随身带了 11 万 token 资料库，是瘦身首选；`design-review` 一用就塞 3.2 万 token 说明书，该把正文拆成按需翻的资料；`frontend-design` 正文只剩个空壳，是写漏了内容。
+
+拿到这些事实之后，删哪个、留哪个、怎么改瘦，决定权全在你——工具只给证据，不动手。
+
+完整报告（500 行，含全部组件明细、重复名单、复查命令）见 **[docs/example-report.md](docs/example-report.md)**。它本身就是用仓库里的脱敏工具生成的：本机路径全部替换成了 `<local-path>`，你可以拿它对照检验脱敏效果。
 
 ## 🚀 安装
 

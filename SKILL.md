@@ -10,7 +10,7 @@ description: |
 license: MIT
 metadata:
   category: agent-tools
-  version: 0.2.0
+  version: 0.2.1
 ---
 
 # 🩺 skill 体检大师（bulus-skill-auditor）
